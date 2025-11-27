@@ -250,35 +250,31 @@ def build_sankey(df: pd.DataFrame):
             "Net income",
         ]
     )
-    # Simple flat color scheme (you can tweak later)
     base_colors = {
-        "Total revenue": "#4285F4",   # blue
-        "Cost of revenues": "#DB4437",  # red
-        "Gross profit": "#0F9D58",   # green
-        "R&D": "#AB47BC",            # purple
+        "Total revenue": "#4285F4",      # blue
+        "Cost of revenues": "#DB4437",   # red
+        "Gross profit": "#0F9D58",       # green
+        "R&D": "#AB47BC",                # purple
         "Sales & marketing": "#F4B400",  # yellow
-        "G&A": "#00ACC1",            # teal
-        "Other opex": "#8D6E63",     # brown
+        "G&A": "#00ACC1",                # teal
+        "Other opex": "#8D6E63",         # brown
         "Operating profit": "#0F9D58",
         "Tax": "#DB4437",
         "Net income": "#0F9D58",
     }
-
     for lab, col in base_colors.items():
         color_map[lab] = col
 
-    # Indices for core nodes
-    idx = {lab: i for i, lab in enumerate(labels)}
-
     # Revenue segment nodes (one per line with Category == "Revenue")
     revenue_rows = df[df["Category"] == "Revenue"]
-    rev_nodes = {}
     for _, row in revenue_rows.iterrows():
         name = row["Item"]
-        if name not in rev_nodes:
-            rev_nodes[name] = len(labels)
+        if name not in labels:
             labels.append(name)
             color_map[name] = "#8AB4F8"  # lighter blue
+
+    # NOW build index after all labels are known
+    idx = {lab: i for i, lab in enumerate(labels)}
 
     sources = []
     targets = []
@@ -316,7 +312,6 @@ def build_sankey(df: pd.DataFrame):
     add_link("Operating profit", "Tax", tax)
     add_link("Operating profit", "Net income", net_income)
 
-    # Build color list in label order
     node_colors = [color_map.get(lab, "#CCCCCC") for lab in labels]
 
     fig = go.Figure(
@@ -347,7 +342,6 @@ def build_sankey(df: pd.DataFrame):
     )
 
     return fig
-
 
 # -------------------------------------------------------------------
 # 6. Show metrics + Sankey

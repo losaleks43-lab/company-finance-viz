@@ -166,8 +166,11 @@ def extract_pnl_with_llm(raw_text: str):
     """
     Use GPT to extract an income statement from raw text.
 
-    We only ask for Item + Amount.
-    Categories are inferred locally using guess_category() to reduce hallucinations.
+    NEW STRATEGY:
+    - One call for REVENUE lines only.
+    - One call for COST / EXPENSE / TAX lines only.
+    - Then merge.
+    - We STILL infer Category locally using guess_category(), not from the model.
     """
     client = get_openai_client()
     if client is None:
@@ -176,99 +179,120 @@ def extract_pnl_with_llm(raw_text: str):
             "Install openai and set OPENAI_API_KEY in secrets or env."
         )
 
-    system_prompt = """
+    # Helper for making a single JSON-returning call
+    def call_llm(system_prompt: str, text: str) -> dict:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+        )
+        content = response.choices[0].message.content.strip()
+
+        # Remove optional ```json fences
+        if content.startswith("```"):
+            parts = content.split("```")
+            if len(parts) >= 2:
+                content = parts[1]
+                if content.lower().startswith("json"):
+                    content = content[4:]
+            content = content.strip()
+
+        return json.loads(content)
+
+    # -------- 1) Revenue-only extraction --------
+    revenue_system_prompt = """
 You are a meticulous financial analyst.
 
-Your task:
-- Extract the FULL income statement (profit and loss) line items
-  from the provided text into a structured JSON object.
+Task: From the provided text, extract ONLY revenue / net sales lines that
+belong to the income statement.
 
-You MUST include:
-- At least one revenue line (e.g. "Net sales", "Total revenue", etc.).
-- All major cost lines (e.g. "Cost of sales", "Cost of revenues").
-- All operating expense lines (e.g. "Selling & administrative", "R&D",
-  "Marketing", "General and administrative", "Other operating expenses").
-- Income tax expense.
-- If available: other income/expense lines that clearly belong to P&L.
-
-Very important rules:
-- NEVER invent numbers or categories that do not appear in the text.
-- Use ONLY numeric values that explicitly appear in the text.
-- If the document shows multiple years in columns, always use the MOST RECENT year
+You MUST:
+- Use ONLY numbers that clearly appear in the text (no guessing).
+- If multiple years are shown in columns, ALWAYS use the MOST RECENT year
   (usually the rightmost column).
-- If there is NO revenue breakdown (only one line like "Net sales"), then return
-  just that one revenue line.
-- If there IS a revenue breakdown (for example by product, brand, geography),
-  return a separate line for each component (e.g. "Net sales - Walmart U.S.",
-  "Net sales - Walmart International", "Net sales - Sam's Club").
-- Do NOT create rows for subtotals like "Total revenue", "Gross profit",
-  "Operating income", "Operating profit", "Net income", "Net earnings".
-- Do NOT attempt to adjust, allocate or re-compute numbers; just copy them.
-- If you are unsure about a line, it is better to OMIT it entirely than to guess.
+- If there is a breakdown (by segment, geography, product, etc.),
+  return a separate line for each component, e.g.:
+  "Net sales - Walmart U.S.", "Net sales - Sam's Club", etc.
+- If there is only one revenue line (e.g. "Net sales"), return just that one.
+- DO NOT include subtotals like "Total net sales", "Total revenues" if that
+  subtotal just sums the other lines.
+- DO NOT include cost or expense lines here.
 
-Output only valid JSON in this exact format:
+Output ONLY valid JSON:
 
 {
   "company": "Company name or null",
   "currency": "3 letter currency code or null",
   "lines": [
     {"item": "Net sales - Segment A", "amount": 1234.56},
-    {"item": "Cost of sales", "amount": 999.99},
-    {"item": "Research and development", "amount": 111.11},
-    {"item": "Selling and marketing", "amount": 222.22},
-    {"item": "General and administrative", "amount": 333.33},
-    {"item": "Other operating expenses", "amount": 444.44},
-    {"item": "Income tax expense", "amount": 555.55}
+    {"item": "Net sales - Segment B", "amount": 2345.67}
   ]
 }
-
-- All amounts must be positive numbers.
-- Use English labels for items.
 """.strip()
 
-    response = client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": raw_text},
-        ],
-        temperature=0,
-    )
+    data_rev = call_llm(revenue_system_prompt, raw_text)
 
-    content = response.choices[0].message.content.strip()
+    # -------- 2) Cost / expense / tax extraction --------
+    cost_system_prompt = """
+You are a meticulous financial analyst.
 
-    # Remove optional markdown fences
-    if content.startswith("```"):
-        parts = content.split("```")
-        if len(parts) >= 2:
-            content = parts[1]
-            if content.lower().startswith("json"):
-                content = content[4:]
-        content = content.strip()
+Task: From the provided text, extract ONLY COST / EXPENSE / TAX line items
+that belong to the income statement (profit and loss).
 
-    data = json.loads(content)
+You MUST include, when present:
+- Cost of sales / Cost of revenues / Cost of goods sold.
+- Operating expenses such as:
+    - Selling, general and administrative
+    - Marketing, advertising
+    - Research and development
+    - Other operating expenses
+- Income tax expense.
+- Other clearly identified income-statement expenses.
 
-    lines = data.get("lines", [])
-    rows = []
-    for line in lines:
-        try:
-            rows.append(
-                {
-                    "Item": line["item"],
-                    "Amount": float(line["amount"]),
-                    # Category will be inferred later
-                }
-            )
-        except Exception:
-            continue
+Very important:
+- Use ONLY numbers that appear in the text (no guessing).
+- If multiple years are shown in columns, ALWAYS use the MOST RECENT year
+  (usually the rightmost column).
+- DO NOT include subtotals like "Total operating expenses",
+  "Total costs and expenses", "Gross profit", "Operating income",
+  "Net income", etc.
+- DO NOT include revenue or net sales here.
 
-    df = pd.DataFrame(rows)
+Output ONLY valid JSON:
 
-    detected_company = data.get("company")
-    detected_currency = data.get("currency")
+{
+  "lines": [
+    {"item": "Cost of sales", "amount": 999.99},
+    {"item": "Selling, general and administrative", "amount": 888.88},
+    {"item": "Income tax expense", "amount": 777.77}
+  ]
+}
+""".strip()
+
+    data_cost = call_llm(cost_system_prompt, raw_text)
+
+    # -------- 3) Merge the two results --------
+    lines = []
+
+    # Company / currency from revenue call (if any)
+    detected_company = data_rev.get("company")
+    detected_currency = data_rev.get("currency")
+
+    for src in (data_rev, data_cost):
+        for line in src.get("lines", []):
+            try:
+                item = line["item"]
+                amount = float(line["amount"])
+                lines.append({"Item": item, "Amount": amount})
+            except Exception:
+                continue
+
+    df = pd.DataFrame(lines)
 
     return df, detected_company, detected_currency
-
 
 def extract_text_from_uploaded_file(uploaded_file) -> str:
     """

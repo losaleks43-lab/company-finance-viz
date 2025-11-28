@@ -1,6 +1,6 @@
 # app.py
-# "How X Makes Money" - Streamlit + Plotly + GPT-4o-mini
-# VERSION: AI-Driven Reasoning (Adaptive to Business Model)
+# "How X Makes Money" - Streamlit + Plotly + GPT Extraction
+# VERSION: Universal Financial Scanner + AI-Driven Reasoning
 
 import os
 import json
@@ -122,7 +122,12 @@ def extract_pnl_with_llm(raw_text: str):
 
 
 def extract_text_from_uploaded_file(uploaded_file) -> str:
-    """Extract text from PDF or TXT."""
+    """
+    Universal 'Metal Detector' Extraction:
+    Scans the ENTIRE PDF and selects pages with the highest density of 
+    financial terms (e.g. 'Net Income', 'Revenue', 'EPS').
+    Works for US (GAAP), India (Ind AS), and Global (IFRS) reports.
+    """
     if uploaded_file is None: return ""
     
     # PDF Handling
@@ -132,29 +137,84 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
             return ""
         try:
             reader = PdfReader(uploaded_file)
-            # Smart filter: Look for P&L pages only to save tokens
-            keywords = ["consolidated statement of profit", "income statement", "statement of operations", "segment revenue", "revenue by"]
-            text_parts = []
+            num_pages = len(reader.pages)
+            page_scores = [] # List of (page_index, score)
+
+            # UNIVERSAL FINANCIAL TERMS (The "Metal Detector")
+            # We look for terms that appear in almost EVERY P&L, regardless of standard.
             
-            for page in reader.pages:
-                text = page.extract_text() or ""
-                # Only keep pages that look like financial tables
-                if any(k in text.lower() for k in keywords):
-                    text_parts.append(text)
+            # Tier 1: Strong Indicators (Table Titles)
+            tier_1_keywords = [
+                "consolidated statement of", "statement of operations", 
+                "statement of income", "profit and loss", "statement of earnings",
+                "segment information", "revenue by"
+            ]
             
-            # If smart filter found nothing, use first 50 pages
-            if text_parts:
-                full_text = "\n".join(text_parts)
-            else:
-                full_text = "\n".join([p.extract_text() for p in reader.pages[:50]])
+            # Tier 2: Row Headers (The actual data lines)
+            tier_2_keywords = [
+                "revenue", "net sales", "gross profit", "operating income", 
+                "cost of sales", "cost of revenue", "selling, general", 
+                "research and development", "income tax", "net income", 
+                "basic earnings per share", "diluted earnings per share",
+                "basic eps", "diluted eps", "profit for the year"
+            ]
+
+            # Scan pages and calculate score
+            for i in range(num_pages):
+                try:
+                    text = reader.pages[i].extract_text()
+                    if not text: continue
+                    
+                    low_text = text.lower()
+                    score = 0
+                    
+                    # Scoring Logic
+                    for kw in tier_1_keywords:
+                        if kw in low_text: score += 10  # Big boost for titles
+                    
+                    for kw in tier_2_keywords:
+                        if kw in low_text: score += 2   # Moderate boost for rows
+                        
+                    # Context Boost: "Year Ended" usually appears in headers
+                    if "year ended" in low_text or "months ended" in low_text:
+                        score += 2
+
+                    page_scores.append((i, score))
+                        
+                except Exception:
+                    continue
+            
+            # Select Top 8 Scoring Pages
+            # We sort by score (descending) and take the top 8.
+            # This usually captures the P&L (1-2 pages) + Segment Info + Notes.
+            top_pages = sorted(page_scores, key=lambda x: x[1], reverse=True)[:8]
+            top_indices = [p[0] for p in top_pages]
+            
+            # Add neighbors? Sometimes tables span 2 pages. 
+            final_indices = set(top_indices)
+            for idx in top_indices:
+                if idx + 1 < num_pages: final_indices.add(idx + 1)
+                if idx - 1 >= 0: final_indices.add(idx - 1)
+            
+            # Sort indices to keep text in order
+            sorted_indices = sorted(list(final_indices))
+            
+            extracted_text = ""
+            for i in sorted_indices:
+                extracted_text += f"--- PAGE {i+1} ---\n"
+                extracted_text += reader.pages[i].extract_text() + "\n\n"
                 
-            return full_text[:100000] # Cap at 100k chars
+            return extracted_text
+
         except Exception as e:
             st.error(f"PDF Error: {e}")
             return ""
             
     # Text Handling
-    return uploaded_file.read().decode("utf-8", errors="ignore")[:100000]
+    try:
+        return uploaded_file.read().decode("utf-8", errors="ignore")[:100000]
+    except Exception:
+        return ""
 
 
 # -------------------------------------------------------------------
@@ -281,3 +341,67 @@ if "raw_df" in st.session_state and st.session_state.raw_df is not None:
             return label_idx[name]
 
         # --- FLOW 1: Segment Revenue -> Total Revenue ---
+        rev_df = clean_df[clean_df["Category"] == "Revenue"]
+        # Group small segments
+        for _, row in rev_df.iterrows():
+            if total_revenue > 0 and (row["Amount"] < (total_revenue * min_share)):
+                s_idx = get_idx("Other Revenue")
+            else:
+                s_idx = get_idx(row["Item"])
+            
+            t_idx = get_idx("Total Revenue")
+            sources.append(s_idx)
+            targets.append(t_idx)
+            values.append(row["Amount"])
+
+        # --- FLOW 2: Total Revenue -> COGS & Gross Profit ---
+        if total_cogs > 0:
+            sources.append(get_idx("Total Revenue"))
+            targets.append(get_idx("COGS")) # Display as "COGS" or "Cost of Revenue"
+            values.append(total_cogs)
+            
+        sources.append(get_idx("Total Revenue"))
+        targets.append(get_idx("Gross Profit"))
+        values.append(gross_profit)
+
+        # --- FLOW 3: Gross Profit -> Opex & Operating Profit ---
+        for cat in opex_cats:
+            amt = grp.get(cat, 0)
+            if amt > 0:
+                sources.append(get_idx("Gross Profit"))
+                targets.append(get_idx(cat))
+                values.append(amt)
+        
+        sources.append(get_idx("Gross Profit"))
+        targets.append(get_idx("Operating Profit")) # Intermediate node
+        values.append(operating_profit)
+
+        # --- FLOW 4: Operating Profit -> Tax & Net Income ---
+        if tax > 0:
+            sources.append(get_idx("Operating Profit"))
+            targets.append(get_idx("Tax"))
+            values.append(tax)
+        
+        sources.append(get_idx("Operating Profit"))
+        targets.append(get_idx("Net Income"))
+        values.append(net_income)
+
+        # Render Plotly Chart
+        fig = go.Figure(data=[go.Sankey(
+            node=dict(
+                pad=20,
+                thickness=20,
+                line=dict(color="black", width=0.5),
+                label=labels,
+                color=colors
+            ),
+            link=dict(
+                source=sources,
+                target=targets,
+                value=values,
+                color="rgba(200,200,200,0.3)"
+            )
+        )])
+        
+        fig.update_layout(title_text="Financial Flow", font_size=14, height=600)
+        st.plotly_chart(fig, use_container_width=True)

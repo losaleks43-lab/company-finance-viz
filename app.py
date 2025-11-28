@@ -1,5 +1,5 @@
 # app.py
-# "How X Makes Money" - Streamlit + Plotly + GPT Extraction
+# "How X Makes Money" - Streamlit + Plotly + GPT-4o-mini
 # VERSION: AI-Driven Reasoning (Adaptive to Business Model)
 
 import os
@@ -66,8 +66,10 @@ def extract_pnl_with_llm(raw_text: str):
     Extract a structured Income Statement from the provided text. You must determine the correct category for each line item based on the company's business model (e.g., Retail vs. Tech vs. Bank).
 
     --- STEP 1: REVENUE (Left Side) ---
+    - Find the **Net Revenue** line (e.g. "Revenue from Operations", "Net Sales").
+    - If the report lists "Gross Revenue" (inc. GST/Excise) and "Net Revenue", use the **Net Revenue** breakdown.
     - Find the **Revenue Segments** (e.g., "iPhone", "Services" or "Oil to Chemicals", "Retail").
-    - IGNORE aggregate totals like "Total Revenue" or "Revenue from Operations" to avoid double counting.
+    - Ensure the sum of segments roughly matches the Net Revenue.
     - Tag these as category: "Revenue".
 
     --- STEP 2: DIRECT COSTS (Middle - The "Cost of Revenue" Flow) ---
@@ -279,67 +281,3 @@ if "raw_df" in st.session_state and st.session_state.raw_df is not None:
             return label_idx[name]
 
         # --- FLOW 1: Segment Revenue -> Total Revenue ---
-        rev_df = clean_df[clean_df["Category"] == "Revenue"]
-        # Group small segments
-        for _, row in rev_df.iterrows():
-            if total_revenue > 0 and (row["Amount"] < (total_revenue * min_share)):
-                s_idx = get_idx("Other Revenue")
-            else:
-                s_idx = get_idx(row["Item"])
-            
-            t_idx = get_idx("Total Revenue")
-            sources.append(s_idx)
-            targets.append(t_idx)
-            values.append(row["Amount"])
-
-        # --- FLOW 2: Total Revenue -> COGS & Gross Profit ---
-        if total_cogs > 0:
-            sources.append(get_idx("Total Revenue"))
-            targets.append(get_idx("COGS")) # Display as "COGS" or "Cost of Revenue"
-            values.append(total_cogs)
-            
-        sources.append(get_idx("Total Revenue"))
-        targets.append(get_idx("Gross Profit"))
-        values.append(gross_profit)
-
-        # --- FLOW 3: Gross Profit -> Opex & Operating Profit ---
-        for cat in opex_cats:
-            amt = grp.get(cat, 0)
-            if amt > 0:
-                sources.append(get_idx("Gross Profit"))
-                targets.append(get_idx(cat))
-                values.append(amt)
-        
-        sources.append(get_idx("Gross Profit"))
-        targets.append(get_idx("Operating Profit")) # Intermediate node
-        values.append(operating_profit)
-
-        # --- FLOW 4: Operating Profit -> Tax & Net Income ---
-        if tax > 0:
-            sources.append(get_idx("Operating Profit"))
-            targets.append(get_idx("Tax"))
-            values.append(tax)
-        
-        sources.append(get_idx("Operating Profit"))
-        targets.append(get_idx("Net Income"))
-        values.append(net_income)
-
-        # Render Plotly Chart
-        fig = go.Figure(data=[go.Sankey(
-            node=dict(
-                pad=20,
-                thickness=20,
-                line=dict(color="black", width=0.5),
-                label=labels,
-                color=colors
-            ),
-            link=dict(
-                source=sources,
-                target=targets,
-                value=values,
-                color="rgba(200,200,200,0.3)"
-            )
-        )])
-        
-        fig.update_layout(title_text="Financial Flow", font_size=14, height=600)
-        st.plotly_chart(fig, use_container_width=True)

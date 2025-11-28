@@ -180,8 +180,16 @@ def extract_pnl_with_llm(raw_text: str):
 You are a meticulous financial analyst.
 
 Your task:
-- Extract ONLY the income statement (profit and loss) line items
+- Extract the FULL income statement (profit and loss) line items
   from the provided text into a structured JSON object.
+
+You MUST include:
+- At least one revenue line (e.g. "Net sales", "Total revenue", etc.).
+- All major cost lines (e.g. "Cost of sales", "Cost of revenues").
+- All operating expense lines (e.g. "Selling & administrative", "R&D",
+  "Marketing", "General and administrative", "Other operating expenses").
+- Income tax expense.
+- If available: other income/expense lines that clearly belong to P&L.
 
 Very important rules:
 - NEVER invent numbers or categories that do not appear in the text.
@@ -548,6 +556,17 @@ sm = cat_sums.get("Sales & Marketing", 0.0)
 ga = cat_sums.get("G&A", 0.0)
 other_opex = cat_sums.get("Other Opex", 0.0)
 tax = cat_sums.get("Tax", 0.0)
+
+# If there are revenues but absolutely no costs/tax, something is off.
+if total_revenue > 0 and (cogs + rnd + sm + ga + other_opex + tax) == 0:
+    st.error(
+        "The AI extraction found revenue but no cost or tax lines. "
+        "This would make all margins 100 %, so the visualization would be misleading.\n\n"
+        "Please either:\n"
+        "• paste or upload a more complete income statement (including 'Cost of sales', expenses, tax), or\n"
+        "• manually add the main cost lines in the table above and set their Category (e.g. COGS, G&A, Tax)."
+    )
+    st.stop()
 
 gross_profit = max(total_revenue - cogs, 0)
 total_opex = rnd + sm + ga + other_opex

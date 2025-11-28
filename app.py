@@ -1,10 +1,5 @@
 # app.py
 # "How X Makes Money" - Streamlit + Plotly + GPT extraction
-#
-# Modes:
-#   - AI (upload PDF/TXT or paste text) -> GPT extracts P&L -> Sankey
-#   - Upload CSV/Excel directly
-#   - Use sample data
 
 import os
 import json
@@ -84,7 +79,7 @@ def guess_category(name: str) -> str:
 
 
 def load_sample_df() -> pd.DataFrame:
-    """Sample Google-like income statement to play with."""
+    """Sample Google-like income statement."""
     data = {
         "Item": [
             "Search advertising revenue",
@@ -132,10 +127,12 @@ def hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+# Session state defaults
 if "raw_df" not in st.session_state:
     st.session_state.raw_df = None
 if "detected_company" not in st.session_state:
     st.session_state.detected_company = "Example Corp"
+
 
 # -------------------------------------------------------------------
 # 1. OpenAI client and AI extraction helper
@@ -212,7 +209,7 @@ Rules:
 
     content = response.choices[0].message.content.strip()
 
-    # remove optional markdown fences
+    # Remove optional markdown fences
     if content.startswith("```"):
         parts = content.split("```")
         if len(parts) >= 2:
@@ -246,34 +243,70 @@ Rules:
 
 
 def extract_text_from_uploaded_file(uploaded_file) -> str:
-    """Turn uploaded PDF/TXT into plain text for the LLM."""
+    """
+    Turn uploaded PDF/TXT into plain text for the LLM.
+
+    For PDFs:
+    - Read all pages
+    - Keep only pages that look like an income statement (keywords)
+    - If nothing matches, fall back to full text
+    """
     if uploaded_file is None:
         return ""
 
     name = uploaded_file.name.lower()
 
-    # TXT
+    # TXT - just read everything
     if name.endswith(".txt") or uploaded_file.type == "text/plain":
         return uploaded_file.read().decode("utf-8", errors="ignore")
 
-    # PDF
+    # PDF - try to keep only income statement pages
     if name.endswith(".pdf"):
         if PdfReader is None:
             raise RuntimeError(
                 "pypdf is not installed. Add 'pypdf' to requirements.txt."
             )
+
         reader = PdfReader(uploaded_file)
-        texts = []
+        all_pages_text = []
         for page in reader.pages:
             try:
-                t = page.extract_text()
+                t = page.extract_text() or ""
             except Exception:
                 t = ""
-            if t:
-                texts.append(t)
-        return "\n\n".join(texts)
+            all_pages_text.append(t)
 
-    # Fallback: try decoding as text anyway
+        keywords = [
+            "income statement",
+            "statement of income",
+            "statement of operations",
+            "statement of earnings",
+            "consolidated statements of income",
+            "consolidated statement of operations",
+            "profit and loss",
+            "statement of profit",
+        ]
+
+        candidate_indices = []
+        for i, t in enumerate(all_pages_text):
+            low = t.lower()
+            if any(kw in low for kw in keywords):
+                candidate_indices.append(i)
+
+        expanded_indices = set()
+        for i in candidate_indices:
+            for j in [i - 1, i, i + 1]:
+                if 0 <= j < len(all_pages_text):
+                    expanded_indices.add(j)
+
+        if expanded_indices:
+            selected_pages = [all_pages_text[i] for i in sorted(expanded_indices)]
+            return "\n\n".join(selected_pages)
+
+        # Fallback: whole doc
+        return "\n\n".join(all_pages_text)
+
+    # Fallback: try decoding anything else as text
     try:
         return uploaded_file.read().decode("utf-8", errors="ignore")
     except Exception:
@@ -304,6 +337,14 @@ input_mode = st.sidebar.radio(
 company_name_override = st.sidebar.text_input(
     "Company name (optional override)",
     value=st.session_state.detected_company,
+)
+
+st.sidebar.markdown("---")
+min_share = st.sidebar.slider(
+    "Min revenue share for separate node",
+    0.0, 0.20, 0.05, 0.01,
+    help="Revenue items smaller than this share of total revenue "
+         "are grouped into 'Other revenue'.",
 )
 
 # Top of main page
@@ -360,7 +401,6 @@ elif input_mode == "AI (upload/paste statement)":
     )
 
     if st.button("Extract with AI"):
-        # Priority: uploaded file, then pasted text
         try:
             raw_text_for_ai = extract_text_from_uploaded_file(uploaded_stmt)
         except Exception as e:
@@ -484,11 +524,12 @@ net_income = max(operating_profit - tax, 0)
 
 company_name = company_name_override or st.session_state.detected_company or "This company"
 
+
 # -------------------------------------------------------------------
-# 6. Sankey builder with brand color
+# 6. Sankey builder with brand color and revenue grouping
 # -------------------------------------------------------------------
 
-def build_sankey(df: pd.DataFrame, primary_color: str):
+def build_sankey(df: pd.DataFrame, primary_color: str, min_share: float):
     labels = []
     color_map = {}
 
@@ -530,9 +571,26 @@ def build_sankey(df: pd.DataFrame, primary_color: str):
     for lab, col in base_colors.items():
         color_map[lab] = col
 
-    revenue_rows = df[df["Category"] == "Revenue"]
-    for _, row in revenue_rows.iterrows():
-        name = row["Item"]
+    # Revenue rows and grouping of small ones
+    revenue_rows = df[df["Category"] == "Revenue"].copy()
+    revenue_nodes = []
+
+    if not revenue_rows.empty:
+        total_rev_seg = revenue_rows["Amount"].sum()
+        threshold = total_rev_seg * min_share
+
+        major_rows = revenue_rows[revenue_rows["Amount"] >= threshold]
+        minor_rows = revenue_rows[revenue_rows["Amount"] < threshold]
+
+        for _, row in major_rows.iterrows():
+            revenue_nodes.append((row["Item"], float(row["Amount"])))
+
+        if not minor_rows.empty:
+            other_sum = float(minor_rows["Amount"].sum())
+            revenue_nodes.append(("Other revenue", other_sum))
+
+    # Create labels for revenue nodes
+    for name, _amount in revenue_nodes:
         if name not in labels:
             labels.append(name)
             color_map[name] = hex_to_rgba(primary, 0.8)
@@ -553,10 +611,8 @@ def build_sankey(df: pd.DataFrame, primary_color: str):
         link_colors.append(hex_to_rgba(src_color, 0.35))
 
     # 1) Revenue segments -> Total revenue
-    for _, row in revenue_rows.iterrows():
-        seg_name = row["Item"]
-        amount = float(row["Amount"])
-        add_link(seg_name, "Total revenue", amount)
+    for name, amount in revenue_nodes:
+        add_link(name, "Total revenue", amount)
 
     # 2) Total revenue -> COGS and Gross profit
     add_link("Total revenue", "Cost of revenues", cogs)
@@ -633,11 +689,12 @@ st.write(
 )
 
 if st.button("Generate chart"):
-    fig = build_sankey(df, brand_color)
+    fig = build_sankey(df, brand_color, min_share)
     st.plotly_chart(fig, use_container_width=True)
     st.info(
         "Tip: use the camera icon in the top right of the chart to download it as a PNG."
     )
 else:
     st.caption("Press the button above to build the Sankey diagram.")
+
 

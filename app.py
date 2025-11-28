@@ -1,3 +1,8 @@
+import streamlit as st
+
+st.write("### DEBUG: Vision Auditor build 2025-11-28")
+
+
 # app.py
 # "How X Makes Money" - Vision Auditor Edition
 # VERSION: Single-File, Multi-Screenshot Reconciliation

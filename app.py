@@ -1,5 +1,6 @@
 # app.py
 # "How X Makes Money" - Streamlit + Plotly + GPT extraction
+# FIXED VERSION: Correct model name, larger text limit, improved prompts.
 
 import os
 import json
@@ -165,12 +166,6 @@ def get_openai_client():
 def extract_pnl_with_llm(raw_text: str):
     """
     Use GPT to extract an income statement from raw text.
-
-    NEW STRATEGY:
-    - One call for REVENUE lines only.
-    - One call for COST / EXPENSE / TAX lines only.
-    - Then merge.
-    - We STILL infer Category locally using guess_category(), not from the model.
     """
     client = get_openai_client()
     if client is None:
@@ -182,24 +177,15 @@ def extract_pnl_with_llm(raw_text: str):
     # Helper for making a single JSON-returning call
     def call_llm(system_prompt: str, text: str) -> dict:
         response = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o-mini",  # <--- FIXED: Correct model name
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text},
             ],
             temperature=0,
+            response_format={"type": "json_object"}  # <--- ADDED: Enforce JSON mode
         )
         content = response.choices[0].message.content.strip()
-
-        # Remove optional ```json fences
-        if content.startswith("```"):
-            parts = content.split("```")
-            if len(parts) >= 2:
-                content = parts[1]
-                if content.lower().startswith("json"):
-                    content = content[4:]
-            content = content.strip()
-
         return json.loads(content)
 
     # -------- 1) Revenue-only extraction --------
@@ -209,20 +195,15 @@ You are a meticulous financial analyst.
 Task: From the provided text, extract ONLY revenue / net sales lines that
 belong to the income statement.
 
-You MUST:
-- Use ONLY numbers that clearly appear in the text (no guessing).
-- If multiple years are shown in columns, ALWAYS use the MOST RECENT year
-  (usually the rightmost column).
-- If there is a breakdown (by segment, geography, product, etc.),
-  return a separate line for each component, e.g.:
-  "Net sales - Walmart U.S.", "Net sales - Sam's Club", etc.
-- If there is only one revenue line (e.g. "Net sales"), return just that one.
-- DO NOT include subtotals like "Total net sales", "Total revenues" if that
-  subtotal just sums the other lines.
-- DO NOT include cost or expense lines here.
+CRITICAL RULES:
+1. Use ONLY numbers that clearly appear in the text.
+2. If multiple years are shown, ALWAYS use the MOST RECENT year.
+3. SEGMENTS VS TOTALS:
+   - If the text breaks down revenue by segment (e.g. "Walmart U.S.", "Sam's Club"), extract the SEGMENTS only.
+   - DO NOT include the "Total Net Sales" or "Consolidated Revenues" line if segments are present, as this causes double counting.
+   - Only include the Total line if no segment breakdown is found.
 
 Output ONLY valid JSON:
-
 {
   "company": "Company name or null",
   "currency": "3 letter currency code or null",
@@ -244,25 +225,16 @@ that belong to the income statement (profit and loss).
 
 You MUST include, when present:
 - Cost of sales / Cost of revenues / Cost of goods sold.
-- Operating expenses such as:
-    - Selling, general and administrative
-    - Marketing, advertising
-    - Research and development
-    - Other operating expenses
+- Operating expenses (SG&A, Marketing, R&D, etc).
 - Income tax expense.
-- Other clearly identified income-statement expenses.
 
-Very important:
-- Use ONLY numbers that appear in the text (no guessing).
-- If multiple years are shown in columns, ALWAYS use the MOST RECENT year
-  (usually the rightmost column).
-- DO NOT include subtotals like "Total operating expenses",
-  "Total costs and expenses", "Gross profit", "Operating income",
-  "Net income", etc.
-- DO NOT include revenue or net sales here.
+CRITICAL RULES:
+1. Use ONLY numbers that appear in the text.
+2. If multiple years are shown, ALWAYS use the MOST RECENT year.
+3. DO NOT include subtotals like "Total operating expenses", "Gross profit", "Operating income", "Net income".
+4. DO NOT include revenue or net sales here.
 
 Output ONLY valid JSON:
-
 {
   "lines": [
     {"item": "Cost of sales", "amount": 999.99},
@@ -297,23 +269,18 @@ Output ONLY valid JSON:
 def extract_text_from_uploaded_file(uploaded_file) -> str:
     """
     Turn uploaded PDF/TXT into plain text for the LLM.
-
-    For PDFs:
-    - Read all pages
-    - Keep only pages that look like income statement / revenue note
-    - Then truncate to keep token usage (and cost) low.
     """
     if uploaded_file is None:
         return ""
 
     name = uploaded_file.name.lower()
 
-    # TXT - just read everything (then truncated)
+    # TXT
     if name.endswith(".txt") or uploaded_file.type == "text/plain":
         text = uploaded_file.read().decode("utf-8", errors="ignore")
-        return text[:20000]  # ~5k tokens → << 1 cent
+        return text[:100000]  # <--- INCREASED LIMIT
 
-    # PDF - smart selection
+    # PDF
     if name.endswith(".pdf"):
         if PdfReader is None:
             raise RuntimeError(
@@ -325,54 +292,64 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
         for page in reader.pages:
             try:
                 t = page.extract_text() or ""
+                all_pages_text.append(t)
             except Exception:
-                t = ""
-            all_pages_text.append(t)
+                all_pages_text.append("")
 
-        # Keywords for income statement pages and revenue notes
-        keywords = [
-            "income statement",
-            "statement of income",
-            "statement of operations",
-            "statement of earnings",
+        # 1. Search for Strong Keywords (Table Titles)
+        strong_keywords = [
             "consolidated statements of income",
+            "consolidated statement of income",
+            "consolidated statements of operations",
             "consolidated statement of operations",
-            "profit and loss",
-            "statement of profit",
-            "net sales",
-            "net revenue",
-            "net revenues",
-            "segment information",
-            "disaggregation of revenue",
+            "consolidated statements of earnings",
+            "consolidated statement of earnings",
+        ]
+        
+        # 2. Search for Weak Keywords (Line items) if titles fail
+        weak_keywords = [
+            "net sales", "cost of sales", "operating income", "income tax expense"
         ]
 
         candidate_indices = []
+        
+        # Phase 1: Look for strong table titles
         for i, t in enumerate(all_pages_text):
             low = t.lower()
-            if any(kw in low for kw in keywords):
+            if any(kw in low for kw in strong_keywords):
                 candidate_indices.append(i)
+        
+        # Phase 2: If no titles found, look for density of line items
+        if not candidate_indices:
+            for i, t in enumerate(all_pages_text):
+                low = t.lower()
+                matches = sum(1 for kw in weak_keywords if kw in low)
+                if matches >= 2: # At least 2 p&l terms on the page
+                    candidate_indices.append(i)
 
         expanded_indices = set()
         for i in candidate_indices:
-            for j in [i - 1, i, i + 1]:
-                if 0 <= j < len(all_pages_text):
-                    expanded_indices.add(j)
+            # Grab page + next page (often tables span 2 pages)
+            expanded_indices.add(i)
+            if i + 1 < len(all_pages_text):
+                expanded_indices.add(i + 1)
 
-        # Limit to at most 8 pages to keep token usage low
+        # Use detected pages, or default to first 50 pages if detection fails
         if expanded_indices:
-            selected_pages = [all_pages_text[i] for i in sorted(expanded_indices)[:8]]
+            selected_pages = [all_pages_text[i] for i in sorted(expanded_indices)]
             text = "\n\n".join(selected_pages)
         else:
-            # Fallback: whole doc but still truncated
-            text = "\n\n".join(all_pages_text)
+            # Fallback: Read first 50 pages (usually covers 10-K financial section)
+            text = "\n\n".join(all_pages_text[:50])
 
-        # Hard truncate to ~20k characters (~5k tokens)
-        return text[:20000]
+        # Soft truncate to keep within context window (GPT-4o-mini has 128k context)
+        # 100k chars is approx 25k tokens, very safe.
+        return text[:100000]  # <--- INCREASED LIMIT
 
-    # Fallback: try decoding anything else as text
+    # Fallback
     try:
         text = uploaded_file.read().decode("utf-8", errors="ignore")
-        return text[:20000]
+        return text[:100000]
     except Exception:
         return ""
 
@@ -423,7 +400,7 @@ st.write(
 )
 
 # -------------------------------------------------------------------
-# 3. Input modes → st.session_state.raw_df
+# 3. Input modes -> st.session_state.raw_df
 # -------------------------------------------------------------------
 
 raw_df = None
@@ -478,7 +455,7 @@ elif input_mode == "AI (upload/paste statement)":
             st.warning("Please upload a PDF/TXT file or paste some text first.")
             st.stop()
 
-        with st.spinner("Calling GPT to extract the income statement..."):
+        with st.spinner("Calling GPT-4o-mini to extract the income statement..."):
             try:
                 df_ai, detected_company, detected_currency = extract_pnl_with_llm(
                     raw_text_for_ai

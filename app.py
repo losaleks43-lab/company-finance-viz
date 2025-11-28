@@ -261,6 +261,98 @@ def extract_pnl_with_llm(raw_text: str):
     df = pd.DataFrame(lines)
     return df, detected_company, detected_currency
 
+def extract_text_from_uploaded_file(uploaded_file) -> str:
+    """
+    Turn uploaded PDF/TXT into plain text for the LLM.
+    Includes smart filtering to find Revenue Segment tables.
+    """
+    if uploaded_file is None:
+        return ""
+
+    name = uploaded_file.name.lower()
+
+    # TXT
+    if name.endswith(".txt") or uploaded_file.type == "text/plain":
+        try:
+            text = uploaded_file.read().decode("utf-8", errors="ignore")
+            return text[:100000]
+        except Exception:
+            return ""
+
+    # PDF
+    if name.endswith(".pdf"):
+        if PdfReader is None:
+            raise RuntimeError(
+                "pypdf is not installed. Add 'pypdf' to requirements.txt."
+            )
+
+        reader = PdfReader(uploaded_file)
+        all_pages_text = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text() or ""
+                all_pages_text.append(t)
+            except Exception:
+                all_pages_text.append("")
+
+        # 1. Search for Strong Keywords (Table Titles & Segments)
+        strong_keywords = [
+            "consolidated statements of income",
+            "consolidated statement of income",
+            "consolidated statements of operations",
+            "consolidated statement of operations",
+            "consolidated statements of earnings",
+            "consolidated statement of earnings",
+            "segment information",          # <--- Critical for Revenue Segments
+            "disaggregated revenue",        # <--- Critical for Revenue Segments
+            "revenue by category"           # <--- Critical for Revenue Segments
+        ]
+        
+        # 2. Search for Weak Keywords (Line items) if titles fail
+        weak_keywords = [
+            "net sales", "cost of sales", "operating income", "income tax expense"
+        ]
+
+        candidate_indices = []
+        
+        # Phase 1: Look for strong table titles
+        for i, t in enumerate(all_pages_text):
+            low = t.lower()
+            if any(kw in low for kw in strong_keywords):
+                candidate_indices.append(i)
+        
+        # Phase 2: If no titles found, look for density of line items
+        if not candidate_indices:
+            for i, t in enumerate(all_pages_text):
+                low = t.lower()
+                matches = sum(1 for kw in weak_keywords if kw in low)
+                if matches >= 2: # At least 2 p&l terms on the page
+                    candidate_indices.append(i)
+
+        expanded_indices = set()
+        for i in candidate_indices:
+            # Grab page + next page (often tables span 2 pages)
+            expanded_indices.add(i)
+            if i + 1 < len(all_pages_text):
+                expanded_indices.add(i + 1)
+
+        # Use detected pages, or default to first 50 pages if detection fails
+        if expanded_indices:
+            selected_pages = [all_pages_text[i] for i in sorted(expanded_indices)]
+            text = "\n\n".join(selected_pages)
+        else:
+            # Fallback: Read first 50 pages (usually covers 10-K financial section)
+            text = "\n\n".join(all_pages_text[:50])
+
+        return text[:100000]
+
+    # Fallback
+    try:
+        text = uploaded_file.read().decode("utf-8", errors="ignore")
+        return text[:100000]
+    except Exception:
+        return ""
+
 # -------------------------------------------------------------------
 # 2. Layout: branding and input controls
 # -------------------------------------------------------------------

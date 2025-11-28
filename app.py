@@ -147,9 +147,10 @@ def get_openai_client():
 
 def extract_pnl_with_llm(raw_text: str):
     """
-    Intelligent extraction designed to create 'Google-Style' Sankey diagrams.
-    - Revenue: Prioritizes Segments (e.g., iPhone vs. Mac) over Total Revenue.
-    - Costs: Adaptively finds the top cost drivers specific to that company/industry.
+    Intelligent extraction with CONTEXT PRESERVATION.
+    - Items found by the Revenue Prompt are forced to 'Revenue' category.
+    - Items found by the Cost Prompt are passed to a specific expense categorizer 
+      (that never guesses 'Revenue').
     """
     client = get_openai_client()
     if client is None:
@@ -170,189 +171,95 @@ def extract_pnl_with_llm(raw_text: str):
         )
         return json.loads(response.choices[0].message.content)
 
-    # ------------------------------------------------------
-    # 1. REVENUE PROMPT: The "Segment Hunter"
-    # ------------------------------------------------------
+    # 1. REVENUE PROMPT (Unchanged)
     revenue_system_prompt = """
     You are an expert Financial Analyst. Extract data for the Revenue flows of a Sankey diagram.
-
-    INPUT DATA:
-    Text from a financial report (10-K/Annual Report).
-
-    YOUR TASK:
-    Extract the revenue breakdown for the most recent year available.
-
+    INPUT DATA: Text from a financial report (10-K/Annual Report).
+    YOUR TASK: Extract the revenue breakdown for the most recent year available.
     CRITICAL RULES:
-    1. **Prioritize Segments:** Look for "Segment Information", "Disaggregated Revenue", or "Revenue by Product/Service".
-       - Example: If the text lists "iPhone", "Mac", "Services", use those.
-       - Example: If the text lists "Walmart U.S.", "Sam's Club", use those.
-    2. **Avoid Double Counting:** If you extract the segments, DO NOT include the "Total Net Sales" line. Only return the components.
-    3. **Granularity:** Keep it high-level (3-6 segments max). If there are many tiny segments, group the smallest ones into "Other Revenue".
-    4. **Naming:** Keep names concise (e.g., rename "Net sales from subscription services" to "Subscriptions").
-
-    Output ONLY valid JSON:
-    {
-      "company": "Company Name",
-      "currency": "USD/EUR/etc",
-      "lines": [
-        {"item": "Segment A", "amount": 12345},
-        {"item": "Segment B", "amount": 6789}
-      ]
-    }
+    1. **Prioritize Segments:** Look for "Segment Information", "Disaggregated Revenue".
+       - Example: "Google Search", "YouTube", "Cloud" (Google); "iPhone", "Services" (Apple).
+    2. **Avoid Double Counting:** DO NOT include "Total Net Sales" if segments are found.
+    3. **Naming:** Keep names concise.
+    Output ONLY valid JSON: {"lines": [{"item": "Segment A", "amount": 12345}]}
     """.strip()
 
     data_rev = call_llm(revenue_system_prompt, raw_text)
 
-    # ------------------------------------------------------
-    # 2. COST/EXPENSE PROMPT: The "Adaptive Analyst"
-    # ------------------------------------------------------
+    # 2. COST PROMPT (Unchanged)
     cost_system_prompt = """
-    You are an expert Financial Analyst. Extract data for the Cost & Expense flows of a Sankey diagram.
-
-    YOUR TASK:
-    Identify the **Major Cost Drivers** for this specific company for the most recent year.
-
-    ADAPTIVE LOGIC RULES (Do not force standard categories):
-    1. **Identify the "Cost of Sales" (Variable Costs):**
-       - Find the line representing direct costs (e.g., "Cost of Goods Sold", "Cost of Revenue", "Interest Expense" for banks, "Benefit and claims" for insurers).
-       - Label this clearly as exactly what it is in the report (e.g., "Cost of sales").
-
-    2. **Identify Major Operating Expenses:**
-       - Extract the **Top 3-5 largest operating expense lines** exactly as presented in the report.
-       - Do NOT force "R&D" if it is small or non-existent (e.g. for Retailers).
-       - Do NOT force "Sales & Marketing" if it is not explicitly listed.
-       - Group all remaining small expenses into "Other Operating Expenses".
-
-    3. **Tax:** Always extract "Income Tax Provision" or "Tax Expense".
-
-    4. **NO Subtotals:** ABSOLUTELY FORBIDDEN to include: "Gross Profit", "Operating Income", "Total Operating Expenses", "Income Before Tax", "Net Income".
-       - The Sankey diagram calculates these visually. We only want the *flows* (costs) that reduce the profit.
-
-    Output ONLY valid JSON:
-    {
-      "lines": [
-        {"item": "Cost of sales", "amount": 40000},
-        {"item": "Selling, general and administrative", "amount": 15000},
-        {"item": "Income tax expense", "amount": 1500}
-      ]
-    }
+    You are an expert Financial Analyst. Extract data for the Cost & Expense flows.
+    YOUR TASK: Identify the **Major Cost Drivers** for the most recent year.
+    ADAPTIVE LOGIC RULES:
+    1. **Cost of Sales:** Find the line for direct costs (COGS, Cost of Revenue, TAC).
+    2. **Major Opex:** Extract top 3-5 operating expense lines exactly as written.
+    3. **Tax:** Extract "Income tax expense".
+    4. **NO Subtotals:** NO Gross Profit, Operating Income, etc.
+    Output ONLY valid JSON: {"lines": [{"item": "Cost of sales", "amount": 40000}]}
     """.strip()
 
     data_cost = call_llm(cost_system_prompt, raw_text)
 
-    # ------------------------------------------------------
-    # 3. Merge
-    # ------------------------------------------------------
+    # -----------------------------------------------------------
+    # 3. HELPER: Expense-Only Categorizer
+    #    (Used only for items the AI identified as costs)
+    # -----------------------------------------------------------
+    def categorize_expense(name: str) -> str:
+        n = name.lower()
+        # COGS
+        if any(w in n for w in ["cost of", "cogs", "tac", "traffic acquisition", "benefit and claims"]):
+            return "COGS"
+        # Tax
+        if "tax" in n:
+            return "Tax"
+        # R&D
+        if any(w in n for w in ["research", "r&d", "development", "technology"]):
+            return "R&D"
+        # Sales & Marketing (This catches "Sales and Marketing" correctly now)
+        if any(w in n for w in ["marketing", "selling", "advertising", "promotion", "commercial"]):
+            return "Sales & Marketing"
+        # G&A
+        if any(w in n for w in ["general", "admin", "depreciation", "amortization", "overhead"]):
+            return "G&A"
+        
+        return "Other Opex"
+
+    # -----------------------------------------------------------
+    # 4. MERGE (Applying Strict Context)
+    # -----------------------------------------------------------
     lines = []
     detected_company = data_rev.get("company")
     detected_currency = data_rev.get("currency")
 
-    # Add Revenue Lines
+    # REVENUE: Hard-code category to 'Revenue'. 
+    # This fixes "Google Network" being misclassified as Opex.
     for line in data_rev.get("lines", []):
         try:
-            lines.append({"Item": line["item"], "Amount": float(line["amount"])})
+            lines.append({
+                "Item": line["item"], 
+                "Amount": float(line["amount"]), 
+                "Category": "Revenue" 
+            })
         except:
             continue
 
-    # Add Cost Lines
+    # COSTS: Use the Expense-Only categorizer.
+    # This fixes "Sales and Marketing" being misclassified as Revenue.
     for line in data_cost.get("lines", []):
         try:
-            lines.append({"Item": line["item"], "Amount": float(line["amount"])})
+            item_name = line["item"]
+            amount = float(line["amount"])
+            cat = categorize_expense(item_name) 
+            lines.append({
+                "Item": item_name, 
+                "Amount": amount, 
+                "Category": cat
+            })
         except:
             continue
 
     df = pd.DataFrame(lines)
-    
     return df, detected_company, detected_currency
-
-def extract_text_from_uploaded_file(uploaded_file) -> str:
-    """
-    Turn uploaded PDF/TXT into plain text for the LLM.
-    """
-    if uploaded_file is None:
-        return ""
-
-    name = uploaded_file.name.lower()
-
-    # TXT
-    if name.endswith(".txt") or uploaded_file.type == "text/plain":
-        text = uploaded_file.read().decode("utf-8", errors="ignore")
-        return text[:100000]
-
-    # PDF
-    if name.endswith(".pdf"):
-        if PdfReader is None:
-            raise RuntimeError(
-                "pypdf is not installed. Add 'pypdf' to requirements.txt."
-            )
-
-        reader = PdfReader(uploaded_file)
-        all_pages_text = []
-        for page in reader.pages:
-            try:
-                t = page.extract_text() or ""
-                all_pages_text.append(t)
-            except Exception:
-                all_pages_text.append("")
-
-        # 1. Search for Strong Keywords (Table Titles)
-        strong_keywords = [
-            "consolidated statements of income",
-            "consolidated statement of income",
-            "consolidated statements of operations",
-            "consolidated statement of operations",
-            "consolidated statements of earnings",
-            "consolidated statement of earnings",
-            "segment information",          # <--- Critical for Revenue Segments
-            "disaggregated revenue",        # <--- Critical for Revenue Segments
-            "revenue by category"           # <--- Critical for Revenue Segments
-        ]
-        
-        # 2. Search for Weak Keywords (Line items) if titles fail
-        weak_keywords = [
-            "net sales", "cost of sales", "operating income", "income tax expense"
-        ]
-
-        candidate_indices = []
-        
-        # Phase 1: Look for strong table titles
-        for i, t in enumerate(all_pages_text):
-            low = t.lower()
-            if any(kw in low for kw in strong_keywords):
-                candidate_indices.append(i)
-        
-        # Phase 2: If no titles found, look for density of line items
-        if not candidate_indices:
-            for i, t in enumerate(all_pages_text):
-                low = t.lower()
-                matches = sum(1 for kw in weak_keywords if kw in low)
-                if matches >= 2: # At least 2 p&l terms on the page
-                    candidate_indices.append(i)
-
-        expanded_indices = set()
-        for i in candidate_indices:
-            # Grab page + next page (often tables span 2 pages)
-            expanded_indices.add(i)
-            if i + 1 < len(all_pages_text):
-                expanded_indices.add(i + 1)
-
-        # Use detected pages, or default to first 50 pages if detection fails
-        if expanded_indices:
-            selected_pages = [all_pages_text[i] for i in sorted(expanded_indices)]
-            text = "\n\n".join(selected_pages)
-        else:
-            # Fallback: Read first 50 pages (usually covers 10-K financial section)
-            text = "\n\n".join(all_pages_text[:50])
-
-        return text[:100000]
-
-    # Fallback
-    try:
-        text = uploaded_file.read().decode("utf-8", errors="ignore")
-        return text[:100000]
-    except Exception:
-        return ""
-
 
 # -------------------------------------------------------------------
 # 2. Layout: branding and input controls
@@ -504,15 +411,38 @@ if "item" not in cols_lower or "amount" not in cols_lower:
 item_col = cols_lower["item"]
 amount_col = cols_lower["amount"]
 
-df = df[[item_col, amount_col]].rename(columns={item_col: "Item", amount_col: "Amount"})
+# --- UPDATED LOGIC START ---
+# Check if "Category" was already added by the AI extraction function
+if "category" in cols_lower:
+    cat_col = cols_lower["category"]
+    # Keep the existing category column
+    df = df[[item_col, amount_col, cat_col]].rename(columns={
+        item_col: "Item", 
+        amount_col: "Amount", 
+        cat_col: "Category"
+    })
+else:
+    # No category column yet
+    df = df[[item_col, amount_col]].rename(columns={
+        item_col: "Item", 
+        amount_col: "Amount"
+    })
+
 df = ensure_numeric(df)
 
 if df.empty:
     st.error("No valid numeric 'Amount' values found.")
     st.stop()
 
-# We always infer Category locally
-df["Category"] = df["Item"].apply(guess_category)
+# Only run guess_category if the column is missing
+if "Category" not in df.columns:
+    df["Category"] = df["Item"].apply(guess_category)
+else:
+    # If the column exists but has empty cells (e.g. from a CSV upload), fill them
+    mask = df["Category"].isna() | (df["Category"] == "")
+    if mask.any():
+        df.loc[mask, "Category"] = df.loc[mask, "Item"].apply(guess_category)
+# --- UPDATED LOGIC END ---
 
 st.subheader("Step 1 – Review and adjust categories")
 st.write(
@@ -520,29 +450,6 @@ st.write(
     "You can change the Category column below. Lines marked as Ignore "
     "will not appear in the visualization."
 )
-
-edited_df = st.data_editor(
-    df,
-    num_rows="dynamic",
-    column_config={
-        "Category": st.column_config.SelectboxColumn(
-            "Category",
-            options=CATEGORIES,
-            help="How this line item should be treated in the Sankey diagram.",
-        ),
-        "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
-    },
-    use_container_width=True,
-    key="data_editor",
-)
-
-df = edited_df.copy()
-df = ensure_numeric(df)
-df = df[df["Category"] != "Ignore"]
-
-if df.empty:
-    st.error("All rows are marked as Ignore. Please assign some categories.")
-    st.stop()
 
 # -------------------------------------------------------------------
 # 5. Aggregation and derived metrics

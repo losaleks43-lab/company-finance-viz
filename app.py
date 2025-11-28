@@ -1,5 +1,10 @@
 # app.py
 # "How X Makes Money" - Streamlit + Plotly + GPT extraction
+#
+# Modes:
+#   - AI (upload PDF/TXT or paste text) -> GPT extracts P&L -> Sankey
+#   - Upload CSV/Excel directly
+#   - Use sample data
 
 import os
 import json
@@ -7,10 +12,18 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
+# PDF text extraction
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+# OpenAI client
 try:
     from openai import OpenAI
 except ImportError:
-    OpenAI = None  # handled later
+    OpenAI = None
+
 
 st.set_page_config(page_title="How X Makes Money", layout="wide")
 
@@ -71,7 +84,7 @@ def guess_category(name: str) -> str:
 
 
 def load_sample_df() -> pd.DataFrame:
-    """Sample Google like income statement."""
+    """Sample Google-like income statement to play with."""
     data = {
         "Item": [
             "Search advertising revenue",
@@ -112,14 +125,13 @@ def hex_to_rgba(hex_color: str, alpha: float) -> str:
     """Convert #RRGGBB to rgba(r,g,b,alpha) string."""
     hex_color = hex_color.lstrip("#")
     if len(hex_color) != 6:
-        return "rgba(150,150,150,{:.2f})".format(alpha)
+        return f"rgba(150,150,150,{alpha:.2f})"
     r = int(hex_color[0:2], 16)
     g = int(hex_color[2:4], 16)
     b = int(hex_color[4:6], 16)
     return f"rgba({r},{g},{b},{alpha})"
 
 
-# Streamlit session defaults
 if "raw_df" not in st.session_state:
     st.session_state.raw_df = None
 if "detected_company" not in st.session_state:
@@ -132,19 +144,14 @@ if "detected_company" not in st.session_state:
 def get_openai_client():
     """Create OpenAI client using Streamlit secrets or env var."""
     api_key = None
-    # st.secrets for Streamlit Cloud
     try:
         api_key = st.secrets.get("OPENAI_API_KEY", None)
     except Exception:
         api_key = None
-    # local env var fallback
     if not api_key:
         api_key = os.getenv("OPENAI_API_KEY")
 
-    if not api_key:
-        return None
-
-    if OpenAI is None:
+    if not api_key or OpenAI is None:
         return None
 
     return OpenAI(api_key=api_key)
@@ -238,8 +245,43 @@ Rules:
     return df, detected_company, detected_currency
 
 
+def extract_text_from_uploaded_file(uploaded_file) -> str:
+    """Turn uploaded PDF/TXT into plain text for the LLM."""
+    if uploaded_file is None:
+        return ""
+
+    name = uploaded_file.name.lower()
+
+    # TXT
+    if name.endswith(".txt") or uploaded_file.type == "text/plain":
+        return uploaded_file.read().decode("utf-8", errors="ignore")
+
+    # PDF
+    if name.endswith(".pdf"):
+        if PdfReader is None:
+            raise RuntimeError(
+                "pypdf is not installed. Add 'pypdf' to requirements.txt."
+            )
+        reader = PdfReader(uploaded_file)
+        texts = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text()
+            except Exception:
+                t = ""
+            if t:
+                texts.append(t)
+        return "\n\n".join(texts)
+
+    # Fallback: try decoding as text anyway
+    try:
+        return uploaded_file.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
 # -------------------------------------------------------------------
-# 2. Layout: title, branding, and input controls
+# 2. Layout: branding and input controls
 # -------------------------------------------------------------------
 
 st.sidebar.header("Branding")
@@ -256,7 +298,7 @@ st.sidebar.header("Input data")
 
 input_mode = st.sidebar.radio(
     "How do you want to provide data?",
-    ["Paste statement (AI extract)", "Upload CSV/Excel", "Use sample data"],
+    ["AI (upload/paste statement)", "Upload CSV/Excel", "Use sample data"],
 )
 
 company_name_override = st.sidebar.text_input(
@@ -270,13 +312,13 @@ if logo_file is not None:
 
 st.title("How X Makes Money")
 st.write(
-    "Paste a company income statement for AI extraction or upload a ready CSV, "
-    "review the line items, and generate a Sankey diagram that shows how the "
-    "company makes and spends money."
+    "Upload a company's financial statement and let AI extract the income statement, "
+    "or upload a ready CSV/Excel. Review the line items and generate a Sankey diagram "
+    "showing how the company makes and spends money."
 )
 
 # -------------------------------------------------------------------
-# 3. Input modes to populate st.session_state.raw_df
+# 3. Input modes → st.session_state.raw_df
 # -------------------------------------------------------------------
 
 raw_df = None
@@ -287,61 +329,81 @@ if input_mode == "Use sample data":
     st.session_state.detected_company = company_name_override or "Example Corp"
 
 elif input_mode == "Upload CSV/Excel":
-    uploaded = st.sidebar.file_uploader(
+    uploaded_csv = st.sidebar.file_uploader(
         "Upload CSV or Excel file",
         type=["csv", "xlsx", "xls"],
         help="File must have columns 'Item' and 'Amount'.",
         key="csv_uploader",
     )
-    if uploaded is not None:
+    if uploaded_csv is not None:
         try:
-            raw_df = pd.read_csv(uploaded)
+            raw_df = pd.read_csv(uploaded_csv)
         except Exception:
-            uploaded.seek(0)
-            raw_df = pd.read_excel(uploaded)
+            uploaded_csv.seek(0)
+            raw_df = pd.read_excel(uploaded_csv)
         st.session_state.raw_df = raw_df
         st.session_state.detected_company = company_name_override or "Example Corp"
 
-elif input_mode == "Paste statement (AI extract)":
-    st.subheader("Step 0 – Paste income statement text")
-    raw_text = st.text_area(
-        "Paste the income statement or the relevant section of the annual report.",
+elif input_mode == "AI (upload/paste statement)":
+    st.subheader("Step 0 – Provide income statement")
+
+    uploaded_stmt = st.file_uploader(
+        "Upload financial statement (PDF or TXT)",
+        type=["pdf", "txt"],
+        key="stmt_uploader",
+    )
+
+    raw_text_manual = st.text_area(
+        "Or paste the income statement text here (income statement section is enough).",
         height=260,
         key="raw_text_area",
     )
 
     if st.button("Extract with AI"):
-        if not raw_text.strip():
-            st.warning("Please paste some text first.")
-        else:
-            with st.spinner("Calling GPT to extract the income statement..."):
-                try:
-                    df_ai, detected_company, detected_currency = extract_pnl_with_llm(raw_text)
-                except Exception as e:
-                    st.error(
-                        "AI extraction failed. Check your API key or try a simpler snippet. "
-                        f"Technical detail: {e}"
-                    )
-                    st.stop()
+        # Priority: uploaded file, then pasted text
+        try:
+            raw_text_for_ai = extract_text_from_uploaded_file(uploaded_stmt)
+        except Exception as e:
+            st.error(f"Error reading uploaded file: {e}")
+            st.stop()
 
-            if df_ai.empty:
-                st.error("AI did not return any line items. Try pasting a clearer statement.")
+        if not raw_text_for_ai.strip():
+            raw_text_for_ai = raw_text_manual
+
+        if not raw_text_for_ai.strip():
+            st.warning("Please upload a PDF/TXT file or paste some text first.")
+            st.stop()
+
+        with st.spinner("Calling GPT to extract the income statement..."):
+            try:
+                df_ai, detected_company, detected_currency = extract_pnl_with_llm(
+                    raw_text_for_ai
+                )
+            except Exception as e:
+                st.error(
+                    "AI extraction failed. Check your API key or try a simpler snippet. "
+                    f"Technical detail: {e}"
+                )
                 st.stop()
 
-            st.session_state.raw_df = df_ai
-            if detected_company:
-                st.session_state.detected_company = detected_company
+        if df_ai.empty:
+            st.error("AI did not return any line items. Try a clearer statement.")
+            st.stop()
 
-            if detected_company:
-                st.success(f"Detected company: {detected_company}")
-            if detected_currency:
-                st.caption(f"Detected currency: {detected_currency}")
+        st.session_state.raw_df = df_ai
+        if detected_company:
+            st.session_state.detected_company = detected_company
+
+        if detected_company:
+            st.success(f"Detected company: {detected_company}")
+        if detected_currency:
+            st.caption(f"Detected currency: {detected_currency}")
 
 # After all branches, use whatever we have in session_state
 raw_df = st.session_state.raw_df
 
 if raw_df is None:
-    st.info("Provide data by pasting a statement and clicking Extract, uploading a CSV, or using the sample.")
+    st.info("Provide data via AI extraction, CSV upload, or the sample option in the sidebar.")
     st.stop()
 
 df = raw_df.copy()
@@ -420,7 +482,6 @@ total_opex = rnd + sm + ga + other_opex
 operating_profit = max(gross_profit - total_opex, 0)
 net_income = max(operating_profit - tax, 0)
 
-# pick final company name
 company_name = company_name_override or st.session_state.detected_company or "This company"
 
 # -------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # app.py
 # "How X Makes Money" - Streamlit + Plotly + GPT extraction
-# FIXED VERSION: Correct model name, larger text limit, improved prompts.
+# VERSION: Intelligent Segment Hunter + Adaptive Expenses
 
 import os
 import json
@@ -40,79 +40,61 @@ CATEGORIES = [
 
 
 def guess_category(name: str) -> str:
-    """Keyword-based guess for a line item category."""
+    """
+    Determines if a line item is Revenue, COGS (Variable), or Opex (Fixed).
+    Order of operations is critical here to avoid misclassifying 'Cost of Sales' as 'Revenue'.
+    """
     if not isinstance(name, str):
         return "Ignore"
     n = name.lower()
 
-    # Revenue
+    # 1. COGS / COST OF REVENUE (The most critical split)
+    # We check this BEFORE revenue to catch "Cost of Revenue" vs "Revenue"
     if any(w in n for w in [
-        "revenue", "revenues", "net sales", "sales",
-        "subscriptions", "subscription",
-        "licensing", "license", "ads", "advertising",
-        "cloud", "services", "membership"
-    ]):
-        return "Revenue"
-
-    # COGS / cost of revenues
-    if any(w in n for w in [
-        "cost of revenues", "cost of revenue",
-        "cost of goods", "cost of sales", "cogs"
+        "cost of", "cogs", "benefit and claims", "interest expense", 
+        "cost of merchandise", "cost of sales", "cost of revenue", 
+        "traffic acquisition costs", "tac"
     ]):
         return "COGS"
 
-    # R&D
-    if any(w in n for w in ["research", "r&d", "development"]):
-        return "R&D"
-
-    # Sales & Marketing
+    # 2. REVENUE
     if any(w in n for w in [
-        "selling", "sales and marketing", "sales & marketing",
-        "marketing"
+        "revenue", "sales", "net sales", "premium", "turnover", "receipts",
+        "membership", "subscriptions", "advertising", "cloud"
     ]):
-        return "Sales & Marketing"
+        return "Revenue"
 
-    # G&A
-    if any(w in n for w in [
-        "general and administrative", "g&a",
-        "administrative", "admin"
-    ]):
-        return "G&A"
-
-    # Tax
+    # 3. TAX
     if "tax" in n:
         return "Tax"
 
-    # Fallback
+    # 4. SPECIFIC OPEX BUCKETS (If present, we map them for specific colors)
+    if any(w in n for w in ["research", "r&d", "development", "technology"]):
+        return "R&D"
+    if any(w in n for w in ["marketing", "selling", "advertising", "promotion", "commercial"]):
+        return "Sales & Marketing"
+    if any(w in n for w in ["general", "admin", "depreciation", "amortization", "overhead"]):
+        return "G&A"
+
+    # 5. CATCH-ALL FOR ADAPTIVE LINES
+    # If the AI extracted "Fuel Costs" or "Restructuring" or "Impairment", it goes here.
     return "Other Opex"
 
 
 def load_sample_df() -> pd.DataFrame:
-    """Sample income statement."""
+    """Sample income statement (Google Style)."""
     data = {
         "Item": [
-            "Search advertising revenue",
-            "YouTube advertising revenue",
-            "Cloud services revenue",
-            "Other revenue",
-            "Cost of revenues",
-            "R&D",
-            "Sales and marketing",
-            "General and administrative",
-            "Other operating expenses",
-            "Income tax expense",
+            "Google Search & other", "YouTube ads", "Google Network", 
+            "Google Cloud", "Other Bets",
+            "Cost of revenues", "R&D", "Sales & marketing", 
+            "General & administrative", "Income taxes"
         ],
         "Amount": [
-            72000,
-            33000,
-            35000,
-            6000,
-            80000,
-            35000,
-            25000,
-            15000,
-            4000,
-            8000,
+            44000, 7000, 8000, 
+            6000, 200,
+            35000, 10000, 5000, 
+            3000, 4000
         ],
     }
     return pd.DataFrame(data)
@@ -165,7 +147,9 @@ def get_openai_client():
 
 def extract_pnl_with_llm(raw_text: str):
     """
-    Use GPT to extract an income statement from raw text.
+    Intelligent extraction designed to create 'Google-Style' Sankey diagrams.
+    - Revenue: Prioritizes Segments (e.g., iPhone vs. Mac) over Total Revenue.
+    - Costs: Adaptively finds the top cost drivers specific to that company/industry.
     """
     client = get_openai_client()
     if client is None:
@@ -174,96 +158,111 @@ def extract_pnl_with_llm(raw_text: str):
             "Install openai and set OPENAI_API_KEY in secrets or env."
         )
 
-    # Helper for making a single JSON-returning call
     def call_llm(system_prompt: str, text: str) -> dict:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # <--- FIXED: Correct model name
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text},
             ],
             temperature=0,
-            response_format={"type": "json_object"}  # <--- ADDED: Enforce JSON mode
+            response_format={"type": "json_object"}
         )
-        content = response.choices[0].message.content.strip()
-        return json.loads(content)
+        return json.loads(response.choices[0].message.content)
 
-    # -------- 1) Revenue-only extraction --------
+    # ------------------------------------------------------
+    # 1. REVENUE PROMPT: The "Segment Hunter"
+    # ------------------------------------------------------
     revenue_system_prompt = """
-You are a meticulous financial analyst.
+    You are an expert Financial Analyst. Extract data for the Revenue flows of a Sankey diagram.
 
-Task: From the provided text, extract ONLY revenue / net sales lines that
-belong to the income statement.
+    INPUT DATA:
+    Text from a financial report (10-K/Annual Report).
 
-CRITICAL RULES:
-1. Use ONLY numbers that clearly appear in the text.
-2. If multiple years are shown, ALWAYS use the MOST RECENT year.
-3. SEGMENTS VS TOTALS:
-   - If the text breaks down revenue by segment (e.g. "Walmart U.S.", "Sam's Club"), extract the SEGMENTS only.
-   - DO NOT include the "Total Net Sales" or "Consolidated Revenues" line if segments are present, as this causes double counting.
-   - Only include the Total line if no segment breakdown is found.
+    YOUR TASK:
+    Extract the revenue breakdown for the most recent year available.
 
-Output ONLY valid JSON:
-{
-  "company": "Company name or null",
-  "currency": "3 letter currency code or null",
-  "lines": [
-    {"item": "Net sales - Segment A", "amount": 1234.56},
-    {"item": "Net sales - Segment B", "amount": 2345.67}
-  ]
-}
-""".strip()
+    CRITICAL RULES:
+    1. **Prioritize Segments:** Look for "Segment Information", "Disaggregated Revenue", or "Revenue by Product/Service".
+       - Example: If the text lists "iPhone", "Mac", "Services", use those.
+       - Example: If the text lists "Walmart U.S.", "Sam's Club", use those.
+    2. **Avoid Double Counting:** If you extract the segments, DO NOT include the "Total Net Sales" line. Only return the components.
+    3. **Granularity:** Keep it high-level (3-6 segments max). If there are many tiny segments, group the smallest ones into "Other Revenue".
+    4. **Naming:** Keep names concise (e.g., rename "Net sales from subscription services" to "Subscriptions").
+
+    Output ONLY valid JSON:
+    {
+      "company": "Company Name",
+      "currency": "USD/EUR/etc",
+      "lines": [
+        {"item": "Segment A", "amount": 12345},
+        {"item": "Segment B", "amount": 6789}
+      ]
+    }
+    """.strip()
 
     data_rev = call_llm(revenue_system_prompt, raw_text)
 
-    # -------- 2) Cost / expense / tax extraction --------
+    # ------------------------------------------------------
+    # 2. COST/EXPENSE PROMPT: The "Adaptive Analyst"
+    # ------------------------------------------------------
     cost_system_prompt = """
-You are a meticulous financial analyst.
+    You are an expert Financial Analyst. Extract data for the Cost & Expense flows of a Sankey diagram.
 
-Task: From the provided text, extract ONLY COST / EXPENSE / TAX line items
-that belong to the income statement (profit and loss).
+    YOUR TASK:
+    Identify the **Major Cost Drivers** for this specific company for the most recent year.
 
-You MUST include, when present:
-- Cost of sales / Cost of revenues / Cost of goods sold.
-- Operating expenses (SG&A, Marketing, R&D, etc).
-- Income tax expense.
+    ADAPTIVE LOGIC RULES (Do not force standard categories):
+    1. **Identify the "Cost of Sales" (Variable Costs):**
+       - Find the line representing direct costs (e.g., "Cost of Goods Sold", "Cost of Revenue", "Interest Expense" for banks, "Benefit and claims" for insurers).
+       - Label this clearly as exactly what it is in the report (e.g., "Cost of sales").
 
-CRITICAL RULES:
-1. Use ONLY numbers that appear in the text.
-2. If multiple years are shown, ALWAYS use the MOST RECENT year.
-3. DO NOT include subtotals like "Total operating expenses", "Gross profit", "Operating income", "Net income".
-4. DO NOT include revenue or net sales here.
+    2. **Identify Major Operating Expenses:**
+       - Extract the **Top 3-5 largest operating expense lines** exactly as presented in the report.
+       - Do NOT force "R&D" if it is small or non-existent (e.g. for Retailers).
+       - Do NOT force "Sales & Marketing" if it is not explicitly listed.
+       - Group all remaining small expenses into "Other Operating Expenses".
 
-Output ONLY valid JSON:
-{
-  "lines": [
-    {"item": "Cost of sales", "amount": 999.99},
-    {"item": "Selling, general and administrative", "amount": 888.88},
-    {"item": "Income tax expense", "amount": 777.77}
-  ]
-}
-""".strip()
+    3. **Tax:** Always extract "Income Tax Provision" or "Tax Expense".
+
+    4. **NO Subtotals:** ABSOLUTELY FORBIDDEN to include: "Gross Profit", "Operating Income", "Total Operating Expenses", "Income Before Tax", "Net Income".
+       - The Sankey diagram calculates these visually. We only want the *flows* (costs) that reduce the profit.
+
+    Output ONLY valid JSON:
+    {
+      "lines": [
+        {"item": "Cost of sales", "amount": 40000},
+        {"item": "Selling, general and administrative", "amount": 15000},
+        {"item": "Income tax expense", "amount": 1500}
+      ]
+    }
+    """.strip()
 
     data_cost = call_llm(cost_system_prompt, raw_text)
 
-    # -------- 3) Merge the two results --------
+    # ------------------------------------------------------
+    # 3. Merge
+    # ------------------------------------------------------
     lines = []
-
-    # Company / currency from revenue call (if any)
     detected_company = data_rev.get("company")
     detected_currency = data_rev.get("currency")
 
-    for src in (data_rev, data_cost):
-        for line in src.get("lines", []):
-            try:
-                item = line["item"]
-                amount = float(line["amount"])
-                lines.append({"Item": item, "Amount": amount})
-            except Exception:
-                continue
+    # Add Revenue Lines
+    for line in data_rev.get("lines", []):
+        try:
+            lines.append({"Item": line["item"], "Amount": float(line["amount"])})
+        except:
+            continue
+
+    # Add Cost Lines
+    for line in data_cost.get("lines", []):
+        try:
+            lines.append({"Item": line["item"], "Amount": float(line["amount"])})
+        except:
+            continue
 
     df = pd.DataFrame(lines)
-
+    
     return df, detected_company, detected_currency
 
 def extract_text_from_uploaded_file(uploaded_file) -> str:
@@ -278,7 +277,7 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
     # TXT
     if name.endswith(".txt") or uploaded_file.type == "text/plain":
         text = uploaded_file.read().decode("utf-8", errors="ignore")
-        return text[:100000]  # <--- INCREASED LIMIT
+        return text[:100000]
 
     # PDF
     if name.endswith(".pdf"):
@@ -304,6 +303,9 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
             "consolidated statement of operations",
             "consolidated statements of earnings",
             "consolidated statement of earnings",
+            "segment information",          # <--- Critical for Revenue Segments
+            "disaggregated revenue",        # <--- Critical for Revenue Segments
+            "revenue by category"           # <--- Critical for Revenue Segments
         ]
         
         # 2. Search for Weak Keywords (Line items) if titles fail
@@ -342,9 +344,7 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
             # Fallback: Read first 50 pages (usually covers 10-K financial section)
             text = "\n\n".join(all_pages_text[:50])
 
-        # Soft truncate to keep within context window (GPT-4o-mini has 128k context)
-        # 100k chars is approx 25k tokens, very safe.
-        return text[:100000]  # <--- INCREASED LIMIT
+        return text[:100000]
 
     # Fallback
     try:

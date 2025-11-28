@@ -39,47 +39,55 @@ CATEGORIES = [
 
 
 def guess_category(name: str) -> str:
-    """Very simple keyword-based guess for a line item category."""
+    """Keyword-based guess for a line item category."""
     if not isinstance(name, str):
         return "Ignore"
     n = name.lower()
 
+    # Revenue
     if any(w in n for w in [
-        "revenue", "sales", "subscriptions", "subscription",
+        "revenue", "revenues", "net sales", "sales",
+        "subscriptions", "subscription",
         "licensing", "license", "ads", "advertising",
         "cloud", "services", "membership"
     ]):
         return "Revenue"
 
+    # COGS / cost of revenues
     if any(w in n for w in [
         "cost of revenues", "cost of revenue",
-        "cost of goods", "cogs", "cost of sales"
+        "cost of goods", "cost of sales", "cogs"
     ]):
         return "COGS"
 
+    # R&D
     if any(w in n for w in ["research", "r&d", "development"]):
         return "R&D"
 
+    # Sales & Marketing
     if any(w in n for w in [
         "selling", "sales and marketing", "sales & marketing",
         "marketing"
     ]):
         return "Sales & Marketing"
 
+    # G&A
     if any(w in n for w in [
         "general and administrative", "g&a",
         "administrative", "admin"
     ]):
         return "G&A"
 
+    # Tax
     if "tax" in n:
         return "Tax"
 
+    # Fallback
     return "Other Opex"
 
 
 def load_sample_df() -> pd.DataFrame:
-    """Sample Google-like income statement."""
+    """Sample income statement."""
     data = {
         "Item": [
             "Search advertising revenue",
@@ -127,7 +135,7 @@ def hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
-# Session state defaults
+# Session defaults
 if "raw_df" not in st.session_state:
     st.session_state.raw_df = None
 if "detected_company" not in st.session_state:
@@ -158,10 +166,8 @@ def extract_pnl_with_llm(raw_text: str):
     """
     Use GPT to extract an income statement from raw text.
 
-    Returns:
-        df (DataFrame with Item, Amount, Category),
-        detected_company (str or None),
-        detected_currency (str or None)
+    We only ask for Item + Amount.
+    Categories are inferred locally using guess_category() to reduce hallucinations.
     """
     client = get_openai_client()
     if client is None:
@@ -171,8 +177,26 @@ def extract_pnl_with_llm(raw_text: str):
         )
 
     system_prompt = """
-You are a financial analyst. Extract the INCOME STATEMENT (profit and loss)
-from the given text and map it to a standardized schema.
+You are a meticulous financial analyst.
+
+Your task:
+- Extract ONLY the income statement (profit and loss) line items
+  from the provided text into a structured JSON object.
+
+Very important rules:
+- NEVER invent numbers or categories that do not appear in the text.
+- Use ONLY numeric values that explicitly appear in the text.
+- If the document shows multiple years in columns, always use the MOST RECENT year
+  (usually the rightmost column).
+- If there is NO revenue breakdown (only one line like "Net sales"), then return
+  just that one revenue line.
+- If there IS a revenue breakdown (for example by product, brand, geography),
+  return a separate line for each component (e.g. "Net sales - Walmart U.S.",
+  "Net sales - Walmart International", "Net sales - Sam's Club").
+- Do NOT create rows for subtotals like "Total revenue", "Gross profit",
+  "Operating income", "Operating profit", "Net income", "Net earnings".
+- Do NOT attempt to adjust, allocate or re-compute numbers; just copy them.
+- If you are unsure about a line, it is better to OMIT it entirely than to guess.
 
 Output only valid JSON in this exact format:
 
@@ -180,22 +204,18 @@ Output only valid JSON in this exact format:
   "company": "Company name or null",
   "currency": "3 letter currency code or null",
   "lines": [
-    {"item": "Sales", "amount": 1234.56, "category": "Revenue"},
-    {"item": "Cost of goods sold", "amount": 999.99, "category": "COGS"},
-    {"item": "Research and development", "amount": 111.11, "category": "R&D"},
-    {"item": "Selling and marketing", "amount": 222.22, "category": "Sales & Marketing"},
-    {"item": "General and administrative", "amount": 333.33, "category": "G&A"},
-    {"item": "Other operating expenses", "amount": 444.44, "category": "Other Opex"},
-    {"item": "Income tax expense", "amount": 555.55, "category": "Tax"}
+    {"item": "Net sales - Segment A", "amount": 1234.56},
+    {"item": "Cost of sales", "amount": 999.99},
+    {"item": "Research and development", "amount": 111.11},
+    {"item": "Selling and marketing", "amount": 222.22},
+    {"item": "General and administrative", "amount": 333.33},
+    {"item": "Other operating expenses", "amount": 444.44},
+    {"item": "Income tax expense", "amount": 555.55}
   ]
 }
 
-Rules:
-- Only include items that clearly belong to the income statement.
-- Category must be one of:
-  "Revenue","COGS","R&D","Sales & Marketing","G&A","Other Opex","Tax".
-- Use positive numbers for all amounts.
-- If multiple lines belong to the same conceptual bucket, keep them as separate items.
+- All amounts must be positive numbers.
+- Use English labels for items.
 """.strip()
 
     response = client.chat.completions.create(
@@ -228,7 +248,7 @@ Rules:
                 {
                     "Item": line["item"],
                     "Amount": float(line["amount"]),
-                    "Category": line.get("category", "Other Opex"),
+                    # Category will be inferred later
                 }
             )
         except Exception:
@@ -248,19 +268,20 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
 
     For PDFs:
     - Read all pages
-    - Keep only pages that look like an income statement (keywords)
-    - If nothing matches, fall back to full text
+    - Keep only pages that look like income statement / revenue note
+    - Then truncate to keep token usage (and cost) low.
     """
     if uploaded_file is None:
         return ""
 
     name = uploaded_file.name.lower()
 
-    # TXT - just read everything
+    # TXT - just read everything (then truncated)
     if name.endswith(".txt") or uploaded_file.type == "text/plain":
-        return uploaded_file.read().decode("utf-8", errors="ignore")
+        text = uploaded_file.read().decode("utf-8", errors="ignore")
+        return text[:20000]  # ~5k tokens → << 1 cent
 
-    # PDF - try to keep only income statement pages
+    # PDF - smart selection
     if name.endswith(".pdf"):
         if PdfReader is None:
             raise RuntimeError(
@@ -276,6 +297,7 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
                 t = ""
             all_pages_text.append(t)
 
+        # Keywords for income statement pages and revenue notes
         keywords = [
             "income statement",
             "statement of income",
@@ -285,6 +307,11 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
             "consolidated statement of operations",
             "profit and loss",
             "statement of profit",
+            "net sales",
+            "net revenue",
+            "net revenues",
+            "segment information",
+            "disaggregation of revenue",
         ]
 
         candidate_indices = []
@@ -299,16 +326,21 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
                 if 0 <= j < len(all_pages_text):
                     expanded_indices.add(j)
 
+        # Limit to at most 8 pages to keep token usage low
         if expanded_indices:
-            selected_pages = [all_pages_text[i] for i in sorted(expanded_indices)]
-            return "\n\n".join(selected_pages)
+            selected_pages = [all_pages_text[i] for i in sorted(expanded_indices)[:8]]
+            text = "\n\n".join(selected_pages)
+        else:
+            # Fallback: whole doc but still truncated
+            text = "\n\n".join(all_pages_text)
 
-        # Fallback: whole doc
-        return "\n\n".join(all_pages_text)
+        # Hard truncate to ~20k characters (~5k tokens)
+        return text[:20000]
 
     # Fallback: try decoding anything else as text
     try:
-        return uploaded_file.read().decode("utf-8", errors="ignore")
+        text = uploaded_file.read().decode("utf-8", errors="ignore")
+        return text[:20000]
     except Exception:
         return ""
 
@@ -470,8 +502,8 @@ if df.empty:
     st.error("No valid numeric 'Amount' values found.")
     st.stop()
 
-if "Category" not in df.columns:
-    df["Category"] = df["Item"].apply(guess_category)
+# We always infer Category locally
+df["Category"] = df["Item"].apply(guess_category)
 
 st.subheader("Step 1 – Review and adjust categories")
 st.write(
@@ -571,7 +603,7 @@ def build_sankey(df: pd.DataFrame, primary_color: str, min_share: float):
     for lab, col in base_colors.items():
         color_map[lab] = col
 
-    # Revenue rows and grouping of small ones
+    # Revenue rows and grouping of small ones – these are your "products"
     revenue_rows = df[df["Category"] == "Revenue"].copy()
     revenue_nodes = []
 
@@ -610,7 +642,7 @@ def build_sankey(df: pd.DataFrame, primary_color: str, min_share: float):
         src_color = color_map.get(src_label, "#AAAAAA")
         link_colors.append(hex_to_rgba(src_color, 0.35))
 
-    # 1) Revenue segments -> Total revenue
+    # 1) Revenue segments ("products") -> Total revenue
     for name, amount in revenue_nodes:
         add_link(name, "Total revenue", amount)
 
@@ -696,5 +728,6 @@ if st.button("Generate chart"):
     )
 else:
     st.caption("Press the button above to build the Sankey diagram.")
+
 
 

@@ -1,10 +1,10 @@
 # logic.py
+# Backend Logic: PDF Scanning & AI Analysis
 import os
 import json
 import pandas as pd
 import streamlit as st
 
-# Try imports to handle missing libraries gracefully
 try:
     from pypdf import PdfReader
 except ImportError:
@@ -18,7 +18,6 @@ except ImportError:
 # 1. Client Setup
 # -------------------------------------------------------------------
 def get_openai_client():
-    # Tries to get key from Streamlit secrets first, then Environment variables
     try:
         api_key = st.secrets.get("OPENAI_API_KEY")
     except:
@@ -38,7 +37,6 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
     """
     if uploaded_file is None: return ""
     
-    # PDF Handling
     if uploaded_file.name.lower().endswith(".pdf"):
         if PdfReader is None:
             return "ERROR: Pypdf is not installed."
@@ -53,7 +51,7 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
                 "consolidated statement of operations", "consolidated statement of earnings"
             ]
             tier_2_keywords = [
-                "segment information", "revenue by segment", "disaggregated revenue",
+                "segment information", "revenue by segment", "disaggregated revenue", "revenue by geography",
                 "revenue from operations", "net sales", "cost of sales"
             ]
             negative_keywords = ["standalone", "separate financial statements"]
@@ -65,15 +63,15 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
                     low_text = text.lower()
                     score = 0
                     
-                    # 1. Big boost for the Main P&L Table
+                    # 1. Big boost for Main P&L
                     for kw in tier_1_keywords:
                         if kw in low_text: score += 20
                     
-                    # 2. Boost for Segment Data
+                    # 2. Boost for Segment/Geo Data
                     for kw in tier_2_keywords:
                         if kw in low_text: score += 5
 
-                    # 3. Penalize Standalone (Crucial for Reliance/Asian reports)
+                    # 3. Penalize Standalone
                     for kw in negative_keywords:
                         if kw in low_text: score -= 15
                         
@@ -84,8 +82,8 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
                     page_scores.append((i, score))
                 except: continue
             
-            # Select Top 6 Scoring Pages
-            top_pages = sorted(page_scores, key=lambda x: x[1], reverse=True)[:6]
+            # Select Top 8 Scoring Pages
+            top_pages = sorted(page_scores, key=lambda x: x[1], reverse=True)[:8]
             top_indices = [p[0] for p in top_pages]
             
             # Add neighbors
@@ -111,57 +109,81 @@ def extract_text_from_uploaded_file(uploaded_file) -> str:
         return ""
 
 # -------------------------------------------------------------------
-# 3. AI Analysis Logic
+# 3. Multi-Mode Analysis Logic
 # -------------------------------------------------------------------
-def extract_pnl_with_llm(raw_text: str):
+def analyze_financials(raw_text: str, mode: str = "product"):
     """
-    Uses Chain-of-Thought reasoning to extract and categorize P&L data.
+    Universal Analysis Function.
+    modes:
+      - 'product': Segment breakdown (Left side)
+      - 'geo': Geographic breakdown (Left side)
+      - 'pnl': Standard Consolidated P&L (No breakdown)
     """
     client = get_openai_client()
     if client is None:
-        raise RuntimeError("OpenAI client is not configured.")
+        return None, None, None
 
-    system_prompt = """
-    You are an expert Financial Analyst building a dataset for a Sankey diagram.
+    # --- SHARED COST INSTRUCTIONS ---
+    cost_instructions = """
+    --- STEP 2: COSTS & EXPENSES (Right Side) ---
+    1. **DIRECT COSTS (COGS):**
+       - Manufacturing/Retail: "Cost of Materials", "Purchases", "Inventory Changes", "Excise Duty".
+       - Tech: "Cost of Revenue", "TAC", "Data Center Costs".
+       - Bank: "Interest Expended".
+       - **Crucial:** Extract these as individual lines. Tag category as "COGS".
+       
+    2. **OPERATING EXPENSES:**
+       - Extract major buckets: "R&D", "Sales & Marketing", "G&A".
+       - If "Employee Benefits" is a major separate line, extract it.
+       
+    3. **TAX:**
+       - Extract "Income Tax Expense". Tag category as "Tax".
+    """
+
+    # --- MODE SPECIFIC INSTRUCTIONS ---
+    if mode == "geo":
+        rev_instructions = """
+        --- STEP 1: REVENUE BY GEOGRAPHY (Left Side) ---
+        - Find the **Geographic/Regional Revenue** table (e.g. "North America", "Europe", "APAC", "India", "US").
+        - Extract the regions as your Revenue items.
+        - Tag them as category: "Revenue".
+        - **Check:** Sum of regions must approx match Total Net Revenue.
+        """
+    elif mode == "pnl":
+        rev_instructions = """
+        --- STEP 1: STANDARD P&L (Left Side) ---
+        - Find the **"Total Revenue"** or **"Net Sales"** line from the main Income Statement.
+        - Do NOT split by segment or geography. Just use the single top-line number.
+        - Label it "Net Sales" or "Total Revenue".
+        - Tag it as category: "Revenue".
+        """
+    else: # default to 'product'
+        rev_instructions = """
+        --- STEP 1: REVENUE BY PRODUCT/SEGMENT (Left Side) ---
+        - Find the **Business Segment Revenue** (e.g. "iPhone", "Services", "Retail", "Digital", "Cloud").
+        - Extract these segments.
+        - Tag them as category: "Revenue".
+        - **Anti-Double Counting:** Do NOT include "Total Revenue" if you list segments.
+        """
+
+    system_prompt = f"""
+    You are an expert Financial Analyst.
     
-    YOUR GOAL: Extract the **CONSOLIDATED** Income Statement for the most recent year.
+    YOUR GOAL: Extract the financial flows for {mode.upper()} view.
     
-    --- PHASE 1: IDENTIFY BUSINESS MODEL ---
-    Determine if the company is:
-    A) Tech/Services (e.g., Google, Meta) -> Look for "Cost of Revenue" or "TAC".
-    B) Manufacturing/Retail (e.g., Reliance, Walmart) -> Look for "Cost of Materials", "Purchases", "Inventory Changes".
-    C) Bank/Financial -> Look for "Interest Expense", "Provisions".
-
-    --- PHASE 2: EXTRACT LINE ITEMS ---
-
-    1. **REVENUE (Left Side)**
-       - Find **Net Revenue** (ignore "Gross Revenue" if it includes collected taxes like GST/Excise).
-       - Find the **Segment Breakdown** (e.g. "Cloud", "Search" or "Retail", "O2C").
-       - Output the SEGMENTS. If segments are unavailable, output the Net Revenue total.
-       - **Double Counting Check:** Do NOT output both the Total AND the Segments. Segments only.
-
-    2. **DIRECT COSTS / COGS (Middle)**
-       - Based on the Business Model identified in Phase 1, extract the direct costs.
-       - **Crucial:** If the report lists "Cost of Materials", "Purchases of Stock", and "Inventory Changes" separately, extract them ALL individually. Tag them as "COGS".
-       - Do NOT extract "Total Expenses".
-
-    3. **OPERATING EXPENSES (Right Side)**
-       - Extract major buckets: "R&D", "Sales & Marketing", "G&A", "Depreciation".
-       - If "Employee Benefits" is a major separate line (common in India/EU), extract it.
-
-    4. **TAX**
-       - Extract "Tax Expense" or "Current + Deferred Tax". Tag as "Tax".
+    {rev_instructions}
+    
+    {cost_instructions}
 
     OUTPUT JSON FORMAT:
-    {
+    {{
         "company": "Company Name",
-        "currency": "Currency Symbol",
+        "currency": "Currency",
         "lines": [
-            {"item": "Segment A", "amount": 100, "category": "Revenue"},
-            {"item": "Cost of Materials", "amount": 60, "category": "COGS"},
-            {"item": "R&D", "amount": 10, "category": "R&D"}
+            {{"item": "North America", "amount": 50000, "category": "Revenue"}},
+            {{"item": "Cost of Materials", "amount": 30000, "category": "COGS"}}
         ]
-    }
+    }}
     """
 
     response = client.chat.completions.create(

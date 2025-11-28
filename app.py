@@ -1,6 +1,6 @@
 # app.py
-# "How X Makes Money" - Screenshot Auditor Edition
-# VERSION: Multi-Image Reconciliation (P&L + Segments)
+# "How X Makes Money" - The AI Auditor Edition
+# VERSION: Multi-Screenshot Reconciliation
 
 import os
 import json
@@ -9,7 +9,7 @@ import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 
-# Try OpenAI import
+# OpenAI Client
 try:
     from openai import OpenAI
 except ImportError:
@@ -18,7 +18,7 @@ except ImportError:
 st.set_page_config(page_title="Financial Flow Auditor", layout="wide")
 
 # -------------------------------------------------------------------
-# 1. Configuration & Styles
+# 0. Configuration
 # -------------------------------------------------------------------
 CATEGORY_COLORS = {
     "Revenue": "#4285F4",       # Blue
@@ -30,14 +30,15 @@ CATEGORY_COLORS = {
     "Other Opex": "#8D6E63",    # Brown
     "Tax": "#E91E63",           # Pink
     "Net Income": "#0F9D58",    # Green
-    "Eliminations": "#5f6368"   # Dark Grey
+    "Unallocated": "#9E9E9E"    # Neutral for reconciliation gaps
 }
 
 # -------------------------------------------------------------------
-# 2. Logic: The AI Auditor
+# 1. Logic & AI Functions
 # -------------------------------------------------------------------
 
 def get_openai_client():
+    # Try secrets first, then env
     try:
         api_key = st.secrets.get("OPENAI_API_KEY")
     except:
@@ -52,69 +53,71 @@ def encode_image(image_file):
     if image_file is None: return None
     return base64.b64encode(image_file.read()).decode('utf-8')
 
-def analyze_dual_screenshots(pnl_image_b64, segment_image_b64):
+def audit_financials_with_vision(pnl_image_b64, segment_image_b64):
     """
-    Sends TWO images to the AI:
-    1. The Master P&L (Source of Truth for Totals)
-    2. The Segment Breakdown (Source of Detail)
-    The AI reconciles them.
+    The Core Logic: Sends both images to GPT-4o-mini with a strict Audit Prompt.
     """
     client = get_openai_client()
     if client is None:
         raise RuntimeError("OpenAI client not configured.")
 
     system_prompt = """
-    You are an expert Financial Auditor performing a reconciliation.
+    You are an expert Financial Auditor. You do not just extract data; you RECONCILE it.
     
     INPUTS:
-    1. Image A: The Consolidated Income Statement (P&L). This is the SOURCE OF TRUTH for Total Revenue and Net Income.
-    2. Image B: The Segment Revenue Breakdown (Product/Geo cuts).
+    1. Image A: Consolidated Income Statement (P&L). This is the SOURCE OF TRUTH for Total Revenue, Costs, and Net Income.
+    2. Image B: Revenue Breakdown (Segments/Geography). This provides the detail for the Revenue side.
 
     YOUR ALGORITHM:
-    
-    --- STEP 1: ESTABLISH TOTALS (From Image A) ---
-    - Extract the "Total Revenue" (or "Net Sales") from Image A. Let's call this [TR].
-    - Extract "Cost of Sales" (COGS), "Operating Expenses", and "Tax" from Image A.
-    
-    --- STEP 2: EXTRACT SEGMENTS (From Image B) ---
-    - Extract revenue segments (e.g., "Cloud", "Retail"). Sum them up. Let's call this [Sum_Seg].
-    
-    --- STEP 3: RECONCILIATION LOGIC (Crucial!) ---
-    - Compare [Sum_Seg] vs [TR].
-    - **Scenario A (Match):** If [Sum_Seg] ≈ [TR] (within 5%), use the segments as the Revenue sources.
-    - **Scenario B (Gap):** If [Sum_Seg] < [TR], create a new segment called "Other/Unallocated" equal to ([TR] - [Sum_Seg]).
-    - **Scenario C (Double Count):** If [Sum_Seg] > [TR] (significantly), look for an "Eliminations" or "Inter-segment" line in Image B. If not found, assume Image B is Gross and Image A is Net; scale the segments down proportionally so they match [TR].
-    
-    --- STEP 4: COSTS & MARGINS ---
-    - Map the costs from Image A to the flows.
-    - **Reliance Specific Check:** If you see "Cost of Materials" + "Purchases of Stock" + "Inventory Changes", sum them as 'COGS'.
-    
-    OUTPUT JSON:
+
+    --- STEP 1: ESTABLISH THE TOTALS (From Image A) ---
+    1. Identify the reporting period and currency.
+    2. Extract "Net Revenue" (or "Revenue from Operations"). Let's call this [TR].
+       - DANGER: Ignore "Gross Revenue" if it includes taxes like GST/Excise. Use the NET figure.
+    3. Extract the Cost Structure:
+       - If Retail/Mfg: Sum "Cost of Materials", "Purchase of Stock", "Inventory Changes", "Excise Duty" -> Tag as "COGS".
+       - If Tech: Extract "Cost of Revenue" -> Tag as "COGS".
+    4. Extract Operating Expenses (R&D, SG&A, etc.) and Tax.
+
+    --- STEP 2: EXTRACT & RECONCILE REVENUE (From Image B) ---
+    1. Extract the segment/product revenue items. Sum them up. Call this [Sum_Seg].
+    2. **Reconciliation Check:**
+       - **Case A (Perfect Match):** [Sum_Seg] ≈ [TR]. Use segments as is.
+       - **Case B (Gap):** [Sum_Seg] < [TR]. Create a new item "Unallocated Revenue" = [TR] - [Sum_Seg].
+       - **Case C (Double Counting):** [Sum_Seg] > [TR] (e.g. Inter-segment sales included). 
+         - Action: Look for "Eliminations" in Image B. If found, include it as a negative revenue item.
+         - Action: If no eliminations found, Scale down all segments proportionally so they equal [TR].
+
+    --- STEP 3: OUTPUT ---
+    Generate a single JSON list representing the flows.
+
+    OUTPUT JSON FORMAT:
     {
-        "company": "Name",
-        "currency": "Symbol",
-        "total_revenue_audit": 100000, 
+        "company": "Company Name",
+        "currency": "Currency Symbol",
+        "audit_note": "Revenue matched perfectly" or "Scaled down segments by 10% to match P&L",
         "lines": [
             {"item": "Segment A", "amount": 60000, "category": "Revenue"},
             {"item": "Segment B", "amount": 40000, "category": "Revenue"},
-            {"item": "Cost of Materials", "amount": 50000, "category": "COGS"}
+            {"item": "Cost of Materials", "amount": 50000, "category": "COGS"},
+            {"item": "Tax Expense", "amount": 10000, "category": "Tax"}
         ]
     }
     """
 
     # Build content payload
-    content = [{"type": "text", "text": "Reconcile these two financial reports."}]
+    content = [{"type": "text", "text": "Perform the financial audit on these documents."}]
     
     if pnl_image_b64:
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{pnl_image_b64}", "detail": "high"}})
-        content.append({"type": "text", "text": "IMAGE A: Consolidated Income Statement (P&L)"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{pnl_image_b64}"}})
+        content.append({"type": "text", "text": "IMAGE A: Master P&L (Source of Truth)"})
     
     if segment_image_b64:
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{segment_image_b64}", "detail": "high"}})
-        content.append({"type": "text", "text": "IMAGE B: Segment / Product Breakdown"})
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{segment_image_b64}"}})
+        content.append({"type": "text", "text": "IMAGE B: Revenue Segmentation"})
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini", # Vision capable and cheap
+        model="gpt-4o-mini", 
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content}
@@ -124,73 +127,78 @@ def analyze_dual_screenshots(pnl_image_b64, segment_image_b64):
     )
     
     data = json.loads(response.choices[0].message.content)
-    df = pd.DataFrame(data.get("lines", []))
     
+    df = pd.DataFrame(data.get("lines", []))
     # Normalize columns
     if "category" not in df.columns: df["category"] = "Other Opex"
     df = df.rename(columns={"item": "Item", "amount": "Amount", "category": "Category"})
     
-    return df, data.get("company"), data.get("currency"), data.get("total_revenue_audit")
+    return df, data.get("company"), data.get("currency"), data.get("audit_note")
 
 # -------------------------------------------------------------------
-# 3. UI & Application
+# 3. UI Layout
 # -------------------------------------------------------------------
 
-st.title("Financial Flow Auditor (Screenshot-Based)")
-st.markdown("Upload screenshots of the **Income Statement** and **Segment Breakdown** to auto-reconcile the data.")
+st.title("Financial Flow Auditor 🕵️‍♂️")
+st.markdown("""
+**Instructions:**
+1. Take a screenshot of the **Consolidated Income Statement** (P&L).
+2. (Optional) Take a screenshot of the **Revenue by Segment/Product** table.
+3. The AI will reconcile the two and build the flow.
+""")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("1. Master P&L")
-    st.info("Upload the main Consolidated Income Statement here.")
-    pnl_file = st.file_uploader("Upload P&L", type=["png", "jpg", "jpeg"], key="pnl")
+    st.subheader("1. Master P&L (Required)")
+    pnl_file = st.file_uploader("Upload P&L Screenshot", type=["png", "jpg", "jpeg"], key="pnl")
     if pnl_file:
-        st.image(pnl_file, caption="Source of Truth (Totals)", use_container_width=True)
+        st.image(pnl_file, caption="P&L Preview", use_container_width=True)
 
 with col2:
-    st.subheader("2. Segment Splits")
-    st.info("Upload the Revenue by Product/Geography table here.")
-    seg_file = st.file_uploader("Upload Breakdown", type=["png", "jpg", "jpeg"], key="seg")
+    st.subheader("2. Revenue Splits (Optional)")
+    seg_file = st.file_uploader("Upload Segment Screenshot", type=["png", "jpg", "jpeg"], key="seg")
     if seg_file:
-        st.image(seg_file, caption="Source of Detail (Segments)", use_container_width=True)
+        st.image(seg_file, caption="Segments Preview", use_container_width=True)
 
-# Run Analysis
-if pnl_file and seg_file:
-    if st.button("Audit & Generate Diagram", type="primary"):
-        with st.spinner("AI is reconciling the two reports..."):
+# Analysis Trigger
+if pnl_file:
+    if st.button("Audit & Visualize", type="primary"):
+        with st.spinner("AI Auditor is reconciling the numbers..."):
             try:
-                # Encode
+                # Encode images
                 pnl_b64 = encode_image(pnl_file)
-                seg_b64 = encode_image(seg_file)
+                seg_b64 = encode_image(seg_file) if seg_file else None
                 
-                # Analyze
-                df_result, company, currency, audit_rev = analyze_dual_screenshots(pnl_b64, seg_b64)
+                # Run Analysis
+                df_result, company, currency, note = audit_financials_with_vision(pnl_b64, seg_b64)
                 
+                # Store in Session
                 st.session_state.raw_df = df_result
                 st.session_state.company_info = f"{company} ({currency})"
-                st.session_state.audit_rev = audit_rev
-                
-                st.success("Reconciliation Complete!")
+                st.session_state.audit_note = note
                 
             except Exception as e:
-                st.error(f"Error: {e}")
+                st.error(f"Analysis Failed: {e}")
 
 # -------------------------------------------------------------------
-# 4. Visualization & Review
+# 4. Results & Visualization
 # -------------------------------------------------------------------
 
 if "raw_df" in st.session_state:
     st.divider()
     df = st.session_state.raw_df.copy()
     
-    # --- Metrics Check ---
-    st.subheader(f"Financials: {st.session_state.company_info}")
-    
-    col_a, col_b = st.columns([2, 1])
-    
-    with col_a:
-        st.caption("Edit the reconciled data if needed:")
+    # --- Header Info ---
+    st.subheader(f"Results for {st.session_state.company_info}")
+    if st.session_state.audit_note:
+        st.info(f"📝 **Auditor Note:** {st.session_state.audit_note}")
+
+    col_data, col_viz = st.columns([1, 2])
+
+    # --- Data Editor ---
+    with col_data:
+        st.markdown("### Review Data")
         edited_df = st.data_editor(
             df,
             column_config={
@@ -198,39 +206,41 @@ if "raw_df" in st.session_state:
                     "Category",
                     options=list(CATEGORY_COLORS.keys()),
                     required=True
-                )
+                ),
+                "Amount": st.column_config.NumberColumn(format="%.0f")
             },
             use_container_width=True,
             num_rows="dynamic"
         )
         clean_df = edited_df.copy()
-    
-    with col_b:
-        # Calculate Flows
+
+    # --- Sankey Logic ---
+    with col_viz:
+        # Calculate Aggregates
         grp = clean_df.groupby("Category")["Amount"].sum()
         
-        rev_segments = clean_df[clean_df["Category"] == "Revenue"]["Amount"].sum()
-        reported_total = st.session_state.audit_rev or rev_segments
+        # Revenue Side
+        rev_segments = clean_df[clean_df["Category"] == "Revenue"]
+        total_revenue = grp.get("Revenue", 0)
         
-        # Delta Check
-        delta = rev_segments - reported_total
-        if abs(delta) > (reported_total * 0.01):
-            st.warning(f"⚠️ Segment Sum ({rev_segments:,.0f}) differs from P&L Total ({reported_total:,.0f}) by {delta:,.0f}.")
-        else:
-            st.success("✅ Revenue Reconciled")
-            
-        # Margins
-        cogs = grp.get("COGS", 0)
-        gross_profit = rev_segments - cogs
-        net_income = gross_profit - sum(grp.get(c, 0) for c in ["R&D", "Sales & Marketing", "G&A", "Other Opex"]) - grp.get("Tax", 0)
+        # Cost Side
+        total_cogs = grp.get("COGS", 0)
+        gross_profit = total_revenue - total_cogs
         
-        st.metric("Total Revenue", f"{rev_segments:,.0f}")
-        st.metric("Gross Margin", f"{(gross_profit/rev_segments)*100:.1f}%")
-        st.metric("Net Margin", f"{(net_income/rev_segments)*100:.1f}%")
+        opex_cats = ["R&D", "Sales & Marketing", "G&A", "Other Opex"]
+        total_opex = sum(grp.get(c, 0) for c in opex_cats)
+        
+        operating_profit = gross_profit - total_opex
+        tax = grp.get("Tax", 0)
+        net_income = operating_profit - tax
 
-    # --- Sankey Diagram ---
-    st.divider()
-    if st.button("Draw Chart"):
+        # Display Key Metrics
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Revenue", f"{total_revenue:,.0f}")
+        m2.metric("Gross Margin", f"{(gross_profit/total_revenue)*100:.1f}%")
+        m3.metric("Net Margin", f"{(net_income/total_revenue)*100:.1f}%")
+        
+        # Build Sankey
         labels, sources, targets, values, colors = [], [], [], [], []
         label_idx = {}
 
@@ -239,36 +249,31 @@ if "raw_df" in st.session_state:
                 label_idx[name] = len(labels)
                 labels.append(name)
                 if name in CATEGORY_COLORS: colors.append(CATEGORY_COLORS[name])
-                elif name == "Total Revenue": colors.append("#000000") # Black for central node
+                elif name == "Total Revenue": colors.append("#000000")
                 else: colors.append("rgba(180,180,180,0.5)")
             return label_idx[name]
 
         # 1. Segments -> Total Revenue
-        for _, row in clean_df[clean_df["Category"] == "Revenue"].iterrows():
+        for _, row in rev_segments.iterrows():
             sources.append(get_idx(row["Item"]))
             targets.append(get_idx("Total Revenue"))
             values.append(row["Amount"])
 
-        # 2. Total Revenue -> COGS & Gross Profit
-        if cogs > 0:
-            sources.append(get_idx("Total Revenue")); targets.append(get_idx("COGS")); values.append(cogs)
+        # 2. Total Revenue -> Costs
+        if total_cogs > 0:
+            sources.append(get_idx("Total Revenue")); targets.append(get_idx("COGS")); values.append(total_cogs)
         
         sources.append(get_idx("Total Revenue")); targets.append(get_idx("Gross Profit")); values.append(gross_profit)
 
         # 3. Gross Profit -> Opex
-        opex_cats = ["R&D", "Sales & Marketing", "G&A", "Other Opex"]
-        total_opex = sum(grp.get(c, 0) for c in opex_cats)
-        
         for cat in opex_cats:
             amt = grp.get(cat, 0)
             if amt > 0:
                 sources.append(get_idx("Gross Profit")); targets.append(get_idx(cat)); values.append(amt)
         
-        operating_profit = gross_profit - total_opex
         sources.append(get_idx("Gross Profit")); targets.append(get_idx("Operating Profit")); values.append(operating_profit)
 
-        # 4. Operating Profit -> Tax & Net Income
-        tax = grp.get("Tax", 0)
+        # 4. Operating Profit -> Net Income
         if tax > 0:
             sources.append(get_idx("Operating Profit")); targets.append(get_idx("Tax")); values.append(tax)
         
@@ -279,5 +284,5 @@ if "raw_df" in st.session_state:
             link=dict(source=sources, target=targets, value=values, color="rgba(200,200,200,0.3)")
         )])
         
-        fig.update_layout(title_text=f"Financial Flow: {st.session_state.company_info}", font_size=14, height=600)
+        fig.update_layout(height=600, margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig, use_container_width=True)
